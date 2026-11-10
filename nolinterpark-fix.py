@@ -1565,8 +1565,9 @@ class MacroThread(QThread):
     def _complete_grade_colors(self, zones, grade_list):
         if not zones or not grade_list:
             return
-        if self._unmatched_grades(zones, grade_list):
-            self._read_grade_colors_from_screen(grade_list)
+        bad = self._unmatched_grades(zones, grade_list)
+        if bad:
+            self._read_grade_colors_from_screen(grade_list, only=bad)
             self._close_price_panel()
         bad = self._unmatched_grades(zones, grade_list)
         if len(bad) == 1:
@@ -1597,7 +1598,7 @@ class MacroThread(QThread):
 
     # 등급 색을 DOM에서 못 읽었을 때: '등급 별 가격' 패널을 열고 화면을 캡처해
     # 각 등급 이름 왼쪽의 색 점을 픽셀로 읽는다. 읽은 색은 grade_list 에 채운다.
-    def _read_grade_colors_from_screen(self, grade_list):
+    def _read_grade_colors_from_screen(self, grade_list, only=None):
         drv = self.driver
         js = r"""
         var names=arguments[0], out=[];
@@ -1639,17 +1640,23 @@ class MacroThread(QThread):
         arr = np.asarray(im).astype(np.int32)
         found = False
         for g, rc in zip(grade_list, r['rects']):
-            if not rc:
+            if not rc or (only and g not in only):
                 continue
-            x0 = int(max(0, (rc[0] - 48) * k)); x1 = int(min(im.width, (rc[0] + 30) * k))
-            y0 = int(max(0, (rc[1] - 8) * k));  y1 = int(min(im.height, (rc[3] + 24) * k))
+            # 등급 이름 바로 왼쪽(같은 줄 ~ 살짝 아래)의 색 점
+            x0 = int(max(0, (rc[0] - 48) * k)); x1 = int(min(im.width, (rc[0] + 24) * k))
+            y0 = int(max(0, (rc[1] - 4) * k));  y1 = int(min(im.height, (rc[3] + 12) * k))
             box = arr[y0:y1, x0:x1].reshape(-1, 3)
             if not len(box):
                 continue
             satp = box[(box.max(axis=1) - box.min(axis=1)) >= 60]
-            if len(satp) >= 8:
-                g['color'] = [int(v) for v in np.median(satp, axis=0)]
-                found = True
+            if len(satp) < 8:
+                continue
+            # 가장 많이 나온 색(점의 속 색)을 고른다
+            keys, counts = np.unique(satp // 8, axis=0, return_counts=True)
+            top = keys[counts.argmax()]
+            sel = satp[(satp // 8 == top).all(axis=1)]
+            g['color'] = [int(v) for v in np.median(sel, axis=0)]
+            found = True
         return found
 
     # 구역 라벨을 실제 마우스로 클릭 (React 이벤트가 확실히 발생하도록)
