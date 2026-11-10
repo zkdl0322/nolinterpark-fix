@@ -356,9 +356,11 @@ class MacroThread(QThread):
             var txt = (el.textContent||'').replace(/\s+/g,' ').trim();
             if (txt.length>40) continue;
             if (!/석|존/.test(txt)) continue;        // 등급명에 '석' 또는 '존'
-            if (!/원/.test(txt)) continue;           // 가격 포함 행
+            if (!/\d[\d,]*\s*원/.test(txt)) continue; // 가격(숫자+원) 포함 행
             var name = txt.replace(/[\d,]+\s*원.*/,'').replace(/\d+\s*석/g,'').replace(/잔여|매진/g,'').replace(/\s+/g,' ').trim();
             if (!name || name.length<2 || seen[name]) continue;
+            // '등급 별 가격' 버튼 문구가 섞인 행, 안내 문구 제외
+            if (/가격|선택해/.test(name)) continue;
             // 색상 swatch (배경색) 찾기
             var color = null;
             var scan = [el].concat([].slice.call(el.querySelectorAll('*')));
