@@ -950,6 +950,141 @@ class MacroThread(QThread):
             canvas:document.querySelectorAll('canvas').length};
     """
 
+    # 구역 번호가 글자가 아니라 그림(path)으로 그려진 배치도용:
+    # 배치도 SVG 안의 '색이 칠해진 도형'을 구역으로 보고 색을 읽는다.
+    # 도형에는 data-macro-zone-shape 속성을 붙여 나중에 클릭할 때 쓴다.
+    _JS_ONESTOP_SHAPES = r"""
+    function toRGB(s){
+        if(!s||s==='none'||s==='transparent') return null;
+        var m=s.match(/(\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?/);
+        if(m){ if(m[4]!==undefined && +m[4]===0) return null;
+               return [+m[1],+m[2],+m[3]]; }
+        var h=s.replace(/^#/,'');
+        if(h.length===3) h=h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+        if(/^[0-9a-f]{6}$/i.test(h)) return [parseInt(h.slice(0,2),16),
+            parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
+        return null;
+    }
+    function fillOf(el){
+        try{
+            var cs=getComputedStyle(el);
+            if(cs.display==='none'||cs.visibility==='hidden') return null;
+            if(parseFloat(cs.fillOpacity)===0||parseFloat(cs.opacity)===0) return null;
+            var rgb=toRGB(cs.fill||'')||toRGB(el.getAttribute('fill')||'');
+            if(!rgb) return null;
+            var r=rgb[0],g=rgb[1],b=rgb[2];
+            if(Math.max(r,g,b)-Math.min(r,g,b)<25) return null;   // 흰/회/검정 (무대, 글자 등)
+            return rgb;
+        }catch(e){ return null; }
+    }
+    // 도형 안쪽의 클릭 가능한 점(뷰포트 좌표) 찾기
+    function innerPoint(el, r){
+        var pts=[[.5,.5],[.5,.3],[.5,.7],[.3,.5],[.7,.5],[.3,.3],[.7,.7],[.3,.7],[.7,.3],
+                 [.5,.15],[.5,.85],[.15,.5],[.85,.5],[.2,.2],[.8,.8],[.2,.8],[.8,.2]];
+        for(var i=0;i<pts.length;i++){
+            var x=r.left+r.width*pts[i][0], y=r.top+r.height*pts[i][1];
+            if(document.elementFromPoint(x,y)===el) return [x,y];
+        }
+        return null;
+    }
+    // 도형/상위 그룹의 속성에서 구역 이름 추출
+    function labelOf(el, root){
+        var n=el;
+        for(var d=0; d<4 && n && n!==root; d++){
+            var cand=[];
+            if(n.getAttribute){
+                cand.push(n.getAttribute('aria-label'));
+                var tt=n.querySelector&&n.querySelector(':scope > title');
+                if(tt) cand.push(tt.textContent);
+                for(var k=0;k<n.attributes.length;k++){
+                    var a=n.attributes[k];
+                    if(/^data-/.test(a.name) && !/^data-macro/.test(a.name)
+                       && /(block|zone|area|section|sector|name|label|title)/i.test(a.name))
+                        cand.push(a.value);
+                }
+            }
+            for(var c=0;c<cand.length;c++){
+                var v=(cand[c]||'').replace(/\s+/g,' ').trim();
+                v=v.replace(/\s*(구역|영역|블록|block)$/i,'');
+                if(v && v.length<=10) return v;
+            }
+            n=n.parentElement;
+        }
+        return '';
+    }
+    var best=null, area=0, svgs=document.querySelectorAll('svg');
+    for(var i=0;i<svgs.length;i++){
+        var b=svgs[i].getBoundingClientRect();
+        if(b.width*b.height>area){ area=b.width*b.height; best=svgs[i]; }
+    }
+    if(!best || area<40000) return {zones:[], sample:''};
+    var box=best.getBoundingClientRect();
+    // 이전 표시 제거
+    var old=best.querySelectorAll('[data-macro-zone-shape]');
+    for(var i=0;i<old.length;i++) old[i].removeAttribute('data-macro-zone-shape');
+    var out=[], sample='';
+    var shapes=best.querySelectorAll('path,polygon,rect,circle,ellipse');
+    for(var i=0;i<shapes.length;i++){
+        var el=shapes[i];
+        var r=el.getBoundingClientRect();
+        if(r.width<12||r.height<12) continue;                 // 글자/좌석점 등
+        if(r.width*r.height>area*0.6) continue;               // 배경
+        var color=fillOf(el);
+        if(!color) continue;
+        var pt=innerPoint(el,r);
+        if(!pt) continue;                                     // 가려졌거나 화면 밖
+        if(!sample) sample=(el.parentElement&&el.parentElement!==best
+                            ? el.parentElement.outerHTML : el.outerHTML).slice(0,400);
+        var cx=(r.left+r.width/2-box.left)/box.width, cy=(r.top+r.height/2-box.top)/box.height;
+        out.push({el:el, color:color, name:labelOf(el,best), cx:cx, cy:cy});
+    }
+    // 위→아래, 왼→오 순으로 번호
+    out.sort(function(a,b){ return (Math.round(a.cy*12)-Math.round(b.cy*12)) || (a.cx-b.cx); });
+    var H=['왼쪽','가운데','오른쪽'], V=['위','중간','아래'], res=[], used={};
+    for(var i=0;i<out.length;i++){
+        var z=out[i];
+        var label=z.name;
+        if(!label || used[label]) label='Z'+(i+1);
+        used[label]=1;
+        z.el.setAttribute('data-macro-zone-shape', label);
+        res.push({label:label, color:z.color, named:!!z.name,
+                  hint:H[Math.min(2,Math.floor(z.cx*3))]+' '+V[Math.min(2,Math.floor(z.cy*3))]});
+    }
+    return {zones:res, sample:sample};
+    """
+
+    # 표시해 둔 구역 도형의 '안쪽 점' 뷰포트 좌표 (없으면 None)
+    _JS_ONESTOP_POINT = r"""
+    var el=document.querySelector('[data-macro-zone-shape="'+arguments[0]+'"]');
+    if(!el) el=document.querySelector('[data-macro-zone="'+arguments[0]+'"]');
+    if(!el) return null;
+    try{ el.scrollIntoView({block:'nearest',inline:'nearest'}); }catch(e){}
+    var r=el.getBoundingClientRect();
+    var pts=[[.5,.5],[.5,.3],[.5,.7],[.3,.5],[.7,.5],[.3,.3],[.7,.7],[.3,.7],[.7,.3],
+             [.5,.15],[.5,.85],[.15,.5],[.85,.5],[.2,.2],[.8,.8],[.2,.8],[.8,.2]];
+    for(var i=0;i<pts.length;i++){
+        var x=r.left+r.width*pts[i][0], y=r.top+r.height*pts[i][1];
+        var top=document.elementFromPoint(x,y);
+        if(top===el || (top && el.contains(top))) return [x,y];
+    }
+    return [r.left+r.width/2, r.top+r.height/2];
+    """
+
+    def _scan_onestop_shapes(self):
+        drv = self.driver
+        try: drv.switch_to.default_content()
+        except Exception: pass
+        try:
+            r = drv.execute_script(self._JS_ONESTOP_SHAPES) or {}
+        except Exception:
+            r = {}
+        zones = r.get('zones') or []
+        for z in zones:
+            z['src'] = 'onestop'
+            z['href'] = ''
+        self._onestop_sample = r.get('sample') or ''
+        return zones
+
     def _scan_onestop_zones(self):
         drv = self.driver
         try: drv.switch_to.default_content()
@@ -972,6 +1107,11 @@ class MacroThread(QThread):
         for z in res:
             z['src'] = 'onestop'
             z['href'] = ''
+        if not res:
+            # 구역 번호가 글자로 없으면 배치도의 색칠된 도형을 구역으로 읽는다
+            shapes = self._scan_onestop_shapes()
+            if shapes:
+                return shapes          # 화면 위치 순서 유지
         if not res:
             self._dump_page("onestop_dump.html")
             if info:
@@ -1004,26 +1144,31 @@ class MacroThread(QThread):
     # 구역 라벨을 실제 마우스로 클릭 (React 이벤트가 확실히 발생하도록)
     def _click_onestop_zone(self, label):
         drv = self.driver
-        for attr in ("data-macro-zone", "data-macro-zone-shape"):
-            try:
-                els = drv.find_elements(By.CSS_SELECTOR, '[%s="%s"]' % (attr, label))
-            except Exception:
-                els = []
-            for el in els:
-                try:
-                    ActionChains(drv).move_to_element(el).click().perform()
-                    return True
-                except Exception:
-                    try:
-                        drv.execute_script(
-                            "var e=arguments[0];['pointerdown','mousedown','pointerup',"
-                            "'mouseup','click'].forEach(function(t){e.dispatchEvent("
-                            "new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));});",
-                            el)
-                        return True
-                    except Exception:
-                        continue
-        return False
+        try:
+            pt = drv.execute_script(self._JS_ONESTOP_POINT, label)
+        except Exception:
+            pt = None
+        if not pt:
+            return False
+        x, y = int(round(pt[0])), int(round(pt[1]))
+        try:
+            ac = ActionChains(drv)
+            ac.w3c_actions.pointer_action.move_to_location(x, y)
+            ac.w3c_actions.pointer_action.click()
+            ac.perform()
+            return True
+        except Exception:
+            pass
+        # 폴백: 그 좌표의 요소에 마우스 이벤트 직접 발생
+        try:
+            drv.execute_script(
+                "var x=arguments[0],y=arguments[1];var e=document.elementFromPoint(x,y);"
+                "if(!e)return;['pointerdown','mousedown','pointerup','mouseup','click']"
+                ".forEach(function(t){e.dispatchEvent(new MouseEvent(t,{bubbles:true,"
+                "cancelable:true,view:window,clientX:x,clientY:y}));});", x, y)
+            return True
+        except Exception:
+            return False
 
     # 구조 파악용으로 현재 페이지 HTML을 파일로 저장
     def _dump_page(self, name):
@@ -1054,8 +1199,13 @@ class MacroThread(QThread):
                 if zs:
                     zone_list = zs
                     self.log(f"[{gname}] 구역 {len(zone_list)}개 (색상으로 매핑)")
+                elif not (grade or {}).get('color'):
+                    self.log(f"'{gname}' 등급 색을 못 읽음 → 전체 구역 표시")
                 else:
-                    self.log(f"'{gname}' 구역 매핑을 못 읽음 → 전체 구역 표시")
+                    self.log(f"'{gname}' 색과 같은 구역을 못 찾음 → 전체 구역 표시")
+            sample = getattr(self, '_onestop_sample', '')
+            if sample and any(z.get('hint') and not z.get('named') for z in all_zones):
+                self.log("[진단] 구역 도형 예시: " + sample[:300])
         elif gname:
             # 1) 좌석등급 패널에서 선택 등급을 클릭해 펼친 뒤 구역을 읽는다
             zs = self._get_zones_for_grade(gname)
@@ -1081,13 +1231,18 @@ class MacroThread(QThread):
                 self.log(f"'{gname}' 구역 매핑을 못 읽음 → 전체 구역 표시")
                 zone_list = all_zones
 
-        zone_list = self._sort_zones(zone_list)
+        unnamed = onestop and any(z.get('hint') and not z.get('named') for z in zone_list)
+        if not unnamed:
+            zone_list = self._sort_zones(zone_list)
         if not zone_list:
             self.log("구역 목록을 읽지 못했습니다. 직접 입력하세요 (예: 105,106)")
         else:
             for i, z in enumerate(zone_list, 1):
                 lbl = z.get('label', '')
-                if '영역' in lbl or '구역' in lbl:
+                if z.get('hint') and not z.get('named'):
+                    # 구역 번호를 읽을 수 없는 배치도: 화면상 위치로 안내
+                    self.log(f"{i}. 구역 ({z['hint']})")
+                elif '영역' in lbl or '구역' in lbl:
                     self.log(f"{i}. {lbl}")
                 else:
                     self.log(f"{i}. {lbl}" + ("구역" if onestop else "영역"))
