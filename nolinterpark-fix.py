@@ -131,6 +131,56 @@ class MacroThread(QThread):
             or "myaccount" in url
         )
 
+    # ── 예매창 찾기 ───────────────────────────
+    # 열려 있는 모든 탭의 주소를 (탭 전환 없이) 조회해 예매창을 찾고,
+    # 찾았을 때만 그 탭으로 한 번 전환한다. 현재 탭이 닫혔거나, 예매창이
+    # 어느 탭에서 열렸든 상관없이 동작한다.
+    def _switch_to_booking_window(self, kws):
+        drv = self.driver
+        # 1) 현재 탭이 이미 예매창
+        try:
+            if any(k in drv.current_url for k in kws):
+                return True
+        except Exception:
+            pass   # 현재 탭이 닫힌 경우 등
+        try:
+            handles = drv.window_handles
+        except Exception:
+            return False
+        # 2) CDP로 전체 탭 주소 조회 (탭을 건드리지 않음)
+        try:
+            infos = drv.execute_cdp_cmd("Target.getTargets", {}).get("targetInfos", [])
+            for t in infos:
+                if t.get("type") != "page":
+                    continue
+                if any(k in (t.get("url") or "") for k in kws):
+                    tid = t.get("targetId")
+                    if tid in handles:
+                        drv.switch_to.window(tid)
+                        self._wait(1.0)
+                        return True
+                    break   # 핸들 형식이 다르면 아래 3)으로 찾는다
+            else:
+                # 예매창이 아직 없음. 현재 탭이 닫혔다면 살아있는 탭으로 옮겨 둔다.
+                try:
+                    drv.current_url
+                except Exception:
+                    if handles:
+                        drv.switch_to.window(handles[-1])
+                return False
+        except Exception:
+            pass
+        # 3) 폴백: 탭을 하나씩 전환하며 확인 (최근 탭부터)
+        for h in reversed(handles):
+            try:
+                drv.switch_to.window(h)
+                if any(k in drv.current_url for k in kws):
+                    self._wait(1.0)
+                    return True
+            except Exception:
+                continue
+        return False
+
     # ── 안심예매 보안문자(캡챠) 감지 ───────────
     # poticket BookMain.asp 는 중첩 iframe 구조라 모든 프레임을 재귀로 훑는다.
     # 보이는 캡챠 입력창 또는 안심예매 안내문이 발견되면 True.
@@ -1808,35 +1858,19 @@ class MacroThread(QThread):
                 except:
                     self._wait(1)
 
-            # ② 예매 페이지 대기 (예매창은 "새 창"으로 열린다)
-            # 매초 창을 번갈아 전환하면 두 창이 계속 새로고침되므로,
-            # 창 개수가 늘어났을 때(=새 예매창 등장)만 그 창으로 "한 번" 전환한다.
+            # ② 예매 페이지 대기 (예매창은 새 탭/같은 탭 어디서든 열릴 수 있다)
+            # 매초 모든 탭의 주소를 전환 없이 조회해, 예매창이 보이면 한 번만 전환한다.
             self.log("원하시는 링크에 들어가서 [예매하기] 버튼을 눌러 주세요.")
             # NOL 인터파크 예매창: 구형 poticket(BookMain.asp) 또는
             # 신형 tickets.interpark.com/onestop/... (예: /onestop/seat)
             booking_kw = ("poticket", "Book", "/onestop")
-            try:
-                known = len(self.driver.window_handles)
-            except Exception:
-                known = 1
             for _ in range(1800):
                 self._wait(1)
-                # 현재 창이 예매 페이지면 완료 (도달 시 딱 한 번만 로그)
-                try:
-                    if any(k in self.driver.current_url for k in booking_kw):
-                        self.log("→ 예매창으로 전환 완료")
-                        break
-                except Exception:
-                    pass
-                # 새 창이 열리면(개수 증가) 가장 최근 창으로 조용히 전환
-                try:
-                    handles = self.driver.window_handles
-                    if len(handles) > known:
-                        known = len(handles)
-                        self.driver.switch_to.window(handles[-1])
-                        self._wait(1.5)
-                except Exception:
-                    pass
+                if self._switch_to_booking_window(booking_kw):
+                    self.log("→ 예매창으로 전환 완료")
+                    break
+            else:
+                self.log("예매창 대기 시간 초과"); return
             self._wait(2)
 
             # ③ 안심예매 보안문자: 예매창에서 직접 입력 → 통과 대기
