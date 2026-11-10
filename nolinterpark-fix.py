@@ -236,6 +236,9 @@ class MacroThread(QThread):
     def _open_price_panel(self):
         # '가격 전체보기' 패널을 연다(등급별 구역 링크가 나열됨). 모든 프레임 시도.
         for xp in [
+            # 신형 onestop 좌석 페이지: 좌측 하단 '등급 별 가격' 버튼
+            "//*[contains(normalize-space(text()),'등급 별 가격')]",
+            "//*[contains(normalize-space(text()),'등급별 가격')]",
             "//*[contains(text(),'가격 전체보기')]",
             "//*[contains(text(),'가격전체보기')]",
             "//*[contains(text(),'좌석가격보기')]",
@@ -1594,7 +1597,9 @@ class MacroThread(QThread):
             # 매초 창을 번갈아 전환하면 두 창이 계속 새로고침되므로,
             # 창 개수가 늘어났을 때(=새 예매창 등장)만 그 창으로 "한 번" 전환한다.
             self.log("원하시는 링크에 들어가서 [예매하기] 버튼을 눌러 주세요.")
-            booking_kw = ("poticket", "Book")  # NOL 인터파크 예매창 = poticket
+            # NOL 인터파크 예매창: 구형 poticket(BookMain.asp) 또는
+            # 신형 tickets.interpark.com/onestop/... (예: /onestop/seat)
+            booking_kw = ("poticket", "Book", "/onestop")
             try:
                 known = len(self.driver.window_handles)
             except Exception:
