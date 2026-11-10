@@ -337,6 +337,94 @@ def read_zone_label(white):
 
 
 # ───────────────────────────────────────────────
+#  좌석 화면(확대된 배치도) 이미지 → 예매 가능 좌석 찾기
+# ───────────────────────────────────────────────
+# 예매 가능한 좌석은 등급 색이 칠해진 작은 동그라미, 매진 좌석은 회색이다.
+# 색이 있는 작은 덩어리 중 동그라미 모양·비슷한 크기인 것만 좌석으로 본다.
+# target: 선택 등급 색 [r,g,b] (None 이면 색 있는 좌석 전부)
+# 반환: [{'fx':0~1, 'fy':0~1, 'color':[r,g,b]}, ...]
+def _hue(c):
+    r, g, b = [v / 255.0 for v in c[:3]]
+    mx, mn = max(r, g, b), min(r, g, b)
+    if mx - mn < 1e-6:
+        return 0.0
+    if mx == r:
+        h = ((g - b) / (mx - mn)) % 6
+    elif mx == g:
+        h = (b - r) / (mx - mn) + 2
+    else:
+        h = (r - g) / (mx - mn) + 4
+    return h * 60.0
+
+
+def find_available_seats(im, target=None, hue_tol=28.0):
+    arr = np.asarray(im.convert("RGB")).astype(np.int32)
+    H, W = arr.shape[:2]
+    if H < 20 or W < 20:
+        return []
+    sat = arr.max(axis=2) - arr.min(axis=2)
+    mask = sat >= 38
+    grid = mask.tolist()
+    comps = []
+    max_side = max(12, int(min(H, W) * 0.09))
+    for y0 in range(H):
+        row = grid[y0]
+        for x0 in range(W):
+            if not row[x0]:
+                continue
+            row[x0] = False
+            stack = [(x0, y0)]
+            n = 0; sx = sy = 0
+            xa = xb = x0; ya = yb = y0
+            best_s, best_c = -1, None
+            while stack:
+                x, y = stack.pop()
+                n += 1; sx += x; sy += y
+                if x < xa: xa = x
+                if x > xb: xb = x
+                if y < ya: ya = y
+                if y > yb: yb = y
+                s = sat[y, x]
+                if s > best_s:
+                    best_s, best_c = s, (x, y)
+                if x > 0 and grid[y][x - 1]:
+                    grid[y][x - 1] = False; stack.append((x - 1, y))
+                if x < W - 1 and grid[y][x + 1]:
+                    grid[y][x + 1] = False; stack.append((x + 1, y))
+                if y > 0 and grid[y - 1][x]:
+                    grid[y - 1][x] = False; stack.append((x, y - 1))
+                if y < H - 1 and grid[y + 1][x]:
+                    grid[y + 1][x] = False; stack.append((x, y + 1))
+            w, h = xb - xa + 1, yb - ya + 1
+            if w < 5 or h < 5 or w > max_side or h > max_side:
+                continue
+            if not (0.75 <= w / float(h) <= 1.34):
+                continue                                   # 동그라미(정사각 bbox)만
+            if n < 0.3 * w * h:
+                continue
+            if xa <= 0 or ya <= 0 or xb >= W - 1 or yb >= H - 1:
+                continue                                   # 화면 가장자리에 잘린 것
+            bx, by = best_c
+            comps.append({'cx': sx / float(n), 'cy': sy / float(n), 'side': (w + h) / 2.0,
+                          'color': [int(v) for v in arr[by, bx]]})
+    if not comps:
+        return []
+    # 좌석은 크기가 서로 같다 → 가장 흔한 크기에서 벗어난 것(아이콘, 글자 등) 제외
+    sides = sorted(c['side'] for c in comps)
+    med = sides[len(sides) // 2]
+    comps = [c for c in comps if 0.7 * med <= c['side'] <= 1.4 * med]
+    if target:
+        th = _hue(target)
+        keep = []
+        for c in comps:
+            d = abs(_hue(c['color']) - th) % 360.0
+            if min(d, 360.0 - d) <= hue_tol:
+                keep.append(c)
+        comps = keep
+    return [{'fx': c['cx'] / W, 'fy': c['cy'] / H, 'color': c['color']} for c in comps]
+
+
+# ───────────────────────────────────────────────
 #  신호 브릿지
 # ───────────────────────────────────────────────
 class Signals(QObject):
@@ -1758,6 +1846,110 @@ class MacroThread(QThread):
         except Exception:
             pass
 
+    # ── 신형 onestop: 배치도 캡처 / 전체보기 복귀 / 좌석 클릭 ──
+    # 배치도 요소를 캡처해 (이미지, 화면상 위치정보) 반환
+    def _onestop_map_shot(self):
+        drv = self.driver
+        try: drv.switch_to.default_content()
+        except Exception: pass
+        try:
+            m = drv.execute_script(self._JS_ONESTOP_MAP)
+            if not m or not m.get('el'):
+                return None, None
+            im = Image.open(io.BytesIO(m['el'].screenshot_as_png)).convert("RGB")
+            return im, m
+        except Exception:
+            return None, None
+
+    # 지금 배치도가 '전체 구역 보기' 상태인지 (색칠된 큰 구역이 보이면 전체 보기)
+    def _onestop_is_overview(self):
+        im, _ = self._onestop_map_shot()
+        if im is None:
+            return None
+        if im.width > 1100:
+            k = 1100.0 / im.width
+            im = im.resize((1100, max(1, int(im.height * k))), Image.NEAREST)
+        try:
+            return len(segment_zone_image(im, None, read_names=False)) > 0
+        except Exception:
+            return None
+
+    # 배치도 영역 안의 '글자 없는 아이콘 버튼'들 (아래쪽 것부터): +, -, 전체보기
+    _JS_ONESTOP_ICON_BUTTONS = r"""
+    var m=arguments[0], out=[];
+    var els=document.querySelectorAll('button,[role="button"]');
+    for(var i=0;i<els.length;i++){
+        var e=els[i], r=e.getBoundingClientRect();
+        if(r.width<20||r.height<20||r.width>120||r.height>120) continue;
+        if((e.textContent||'').replace(/\s+/g,'').length>1) continue;   // 아이콘 버튼만
+        var cx=r.left+r.width/2, cy=r.top+r.height/2;
+        if(cx<m.left||cx>m.left+m.width||cy<m.top||cy>m.top+m.height) continue;
+        out.push([cx,cy,r.bottom]);
+    }
+    out.sort(function(a,b){return b[2]-a[2];});
+    return out;
+    """
+
+    # 좌석 화면(확대 상태)에서 전체 구역 보기로 되돌린다.
+    def _onestop_back_to_overview(self):
+        if self._onestop_is_overview():
+            return True
+        drv = self.driver
+        try:
+            m = drv.execute_script(self._JS_ONESTOP_MAP)
+            btns = drv.execute_script(self._JS_ONESTOP_ICON_BUTTONS, m) or []
+        except Exception:
+            btns = []
+        # 1) 맨 아래 아이콘 버튼 = 전체보기(화면 맞춤)
+        if btns:
+            self._click_viewport_point(btns[0][0], btns[0][1])
+            self._wait(0.6)
+            if self._onestop_is_overview():
+                return True
+        # 2) 그 위 버튼 = 축소(-) 를 여러 번
+        if len(btns) >= 2:
+            for _ in range(8):
+                self._click_viewport_point(btns[1][0], btns[1][1])
+                self._wait(0.25)
+                if self._onestop_is_overview():
+                    return True
+        if not getattr(self, '_overview_warned', False):
+            self._overview_warned = True
+            self.log("전체 구역 보기로 돌아가지 못했습니다 (전체보기 버튼을 못 찾음). "
+                     "배치도 오른쪽 아래 [화면 맞춤] 버튼을 직접 눌러 주세요.")
+        return False
+
+    # 좌석 화면에서 선택 등급 색의 예매 가능 좌석을 찾아 클릭한다.
+    def _click_onestop_seat(self, grade=None):
+        if self._seat_selected() is True:
+            self.log("→ 좌석 이미 선택됨")
+            return True
+        target = (grade or {}).get('color')
+        if not self._color_ok(target):
+            target = None
+        if self.delay < 0.7:
+            self._wait(0.7 - self.delay)          # 확대 애니메이션이 끝나길 잠깐 대기
+        im, m = self._onestop_map_shot()
+        if im is None:
+            return False
+        try:
+            seats = find_available_seats(im, target)
+        except Exception:
+            seats = []
+        if not seats:
+            return False
+        import random
+        random.shuffle(seats)
+        for st in seats[:3]:
+            self._click_viewport_point(m['left'] + m['width'] * st['fx'],
+                                       m['top'] + m['height'] * st['fy'])
+            self._wait(0.4)
+            self._accept_alert()
+            if self._seat_selected() is True:
+                self.log("→ 좌석 선택 성공")
+                return True
+        return False
+
     # ── 신형 onestop: 구역 목록 표시 + 선택 ────
     # 형식:  1. 모두 / 2. A / 3. B ... / 11. 207 ...
     def _choose_onestop_zones(self, zone_list):
@@ -1906,6 +2098,8 @@ class MacroThread(QThread):
     # ── 좌석 클릭 ─────────────────────────────
     # grade: {'name','color':[r,g,b]} 또는 None(모두)
     def _click_seat(self, grade=None):
+        if self._is_onestop():
+            return self._click_onestop_seat(grade)
         drv = self.driver
         target = (grade or {}).get("color")  # [r,g,b] 또는 None
 
@@ -2133,6 +2327,29 @@ class MacroThread(QThread):
     # 선택좌석 패널의 '총 N석' 값으로 실제 선택 여부 확인.
     # True=선택됨, False=0석(미선택), None=확인불가
     def _seat_selected(self):
+        if self._is_onestop():
+            # 오른쪽 '선택 좌석 N' 의 N, 없으면 '선택한 좌석이 없습니다' 문구로 판단
+            js = r"""
+            var els=document.querySelectorAll('h1,h2,h3,h4,h5,strong,b,span,div,p');
+            for(var i=0;i<els.length;i++){
+                var t=(els[i].textContent||'').replace(/\s+/g,'');
+                if(t.length>12) continue;
+                var m=t.match(/^선택좌석(\d+)(석|매)?$/);
+                if(m) return +m[1];
+            }
+            var body=(document.body?document.body.innerText:'').replace(/\s+/g,'');
+            if(body.indexOf('선택한좌석이없습니다')>=0) return 0;
+            if(body.indexOf('선택좌석')>=0) return -1;     // 문구는 있는데 개수 표시가 없음
+            return null;
+            """
+            try:
+                self.driver.switch_to.default_content()
+                n = self.driver.execute_script(js)
+            except Exception:
+                return None
+            if n is None or n == -1:
+                return None
+            return n > 0
         def fn():
             try:
                 t = self.driver.execute_script(
@@ -2249,6 +2466,11 @@ class MacroThread(QThread):
         except Exception: pass
         if self._is_onestop():
             zd = zone if isinstance(zone, dict) else None
+            # 앞 구역의 좌석 화면(확대 상태)에 있으면 전체 구역 보기로 되돌린다
+            if zd is not None and zd.get('fx') is not None:
+                if self._onestop_back_to_overview() is False:
+                    # 확대된 상태에서 구역 위치를 누르면 엉뚱한 좌석이 눌릴 수 있어 건너뜀
+                    return False
             if self._click_onestop_zone(zone_num, zd):
                 return True
             # 화면이 다시 그려져 표시가 사라졌으면 다시 스캔 후 재시도
@@ -2476,6 +2698,30 @@ class MacroThread(QThread):
         kws = ['좌석선택완료', '티켓가격선택', '가격선택', '선택완료']
         self.log("좌석선택완료 버튼 찾는 중...")
         drv = self.driver
+        if self._is_onestop():
+            try: drv.switch_to.default_content()
+            except Exception: pass
+            hit = None
+            try:
+                # 오른쪽 아래 [선택 완료] 버튼을 실제 마우스로 클릭
+                for el in drv.find_elements(By.XPATH,
+                        "//button[normalize-space(.)='선택 완료' or normalize-space(.)='선택완료']"):
+                    if el.is_displayed() and el.is_enabled():
+                        try:
+                            ActionChains(drv).move_to_element(el).click().perform()
+                        except Exception:
+                            drv.execute_script("arguments[0].click();", el)
+                        hit = '선택 완료'
+                        break
+            except Exception:
+                pass
+            if not hit:
+                hit = self._click_text_button(["선택완료"])
+            self._wait(1.0)
+            self._accept_alert()
+            self.log(f"→ [{hit}] 클릭" if hit else "→ [선택 완료] 버튼을 찾지 못했습니다")
+            self._wait(1.0)
+            return
         try: drv.switch_to.default_content()
         except Exception: pass
         hit = self._click_complete_recursive(kws, 0)
@@ -2576,6 +2822,11 @@ class MacroThread(QThread):
     # poticket 은 단계가 iframe 으로 바뀌므로 URL이 아닌 '내용'으로 판단한다.
     # 아직 좌석배치도(좌석선택)면 False, 다음 단계 키워드가 보이면 True.
     def _is_payment_page(self):
+        if self._is_onestop():
+            # 좌석 단계(/onestop/seat)를 벗어나 다음 단계 주소로 넘어갔는지
+            u = self._url().split('?')[0].rstrip('/')
+            if not u.endswith('/seat'):
+                return True
         def fn():
             try:
                 t = self.driver.execute_script(
