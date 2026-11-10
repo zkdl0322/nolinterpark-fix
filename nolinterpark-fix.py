@@ -43,6 +43,300 @@ GRADES = ["스탠딩R", "스탠딩S", "지정석R", "지정석S", "지정석A", 
 
 
 # ───────────────────────────────────────────────
+#  좌석배치도 이미지 → 구역 분리
+# ───────────────────────────────────────────────
+# 배치도를 '그림'으로 보고, 같은 색으로 이어진 덩어리 하나를 구역 하나로 본다.
+# (구역 사이의 흰 경계선이 덩어리를 나눠 준다. svg/img/canvas 어떤 방식으로
+#  그려졌든 화면에 보이는 그대로 읽으므로 DOM 구조와 무관하게 동작한다.)
+# palette: 등급 범례 색 [[r,g,b], ...]  (없으면 유채색을 자동으로 묶는다)
+# 반환: [{'color':[r,g,b], 'fx':0~1, 'fy':0~1, 'size':픽셀수, 'name':구역이름}, ...]
+#       fx,fy = 이미지 안에서 그 구역 '안쪽 점'의 상대 위치(클릭용)
+#       name  = 구역 안의 흰 글자를 읽은 이름(A, 207 ...). 못 읽으면 ''
+def segment_zone_image(im, palette=None, tol=70, read_names=True):
+    arr = np.asarray(im.convert("RGB")).astype(np.int32)
+    H, W = arr.shape[:2]
+    if H < 20 or W < 20:
+        return []
+    if palette:
+        pal = np.array(palette, dtype=np.int32)                      # (P,3)
+        d = np.abs(arr[:, :, None, :] - pal[None, None, :, :]).sum(axis=3)
+        cls = d.argmin(axis=2)
+        mask = d.min(axis=2) <= tol
+        colors = [list(map(int, c)) for c in pal]
+    else:
+        mx, mn = arr.max(axis=2), arr.min(axis=2)
+        mask = (mx - mn) > 45                                        # 유채색만
+        q = arr // 40
+        cls = q[:, :, 0] * 100 + q[:, :, 1] * 10 + q[:, :, 2]
+        colors = None
+    cls = np.where(mask, cls, -1)
+    # 경계에서 3px 이상 떨어진 '안쪽' 픽셀 (클릭 지점 후보)
+    inner = mask.copy()
+    for dy, dx in ((3, 0), (-3, 0), (0, 3), (0, -3), (2, 2), (-2, -2), (2, -2), (-2, 2)):
+        sh = np.zeros_like(mask)
+        ys = slice(max(dy, 0), H + min(dy, 0)); yd = slice(max(-dy, 0), H + min(-dy, 0))
+        xs = slice(max(dx, 0), W + min(dx, 0)); xd = slice(max(-dx, 0), W + min(-dx, 0))
+        sh[yd, xd] = mask[ys, xs]
+        inner &= sh
+    grid = cls.tolist()
+    inner_l = inner.tolist()
+    minrgb = arr.min(axis=2)
+    # 배경 밝기(구역이 아닌 무채색 픽셀의 중앙값) - 흰 글자와 배경을 구분하는 기준
+    grey = (~mask) & ((arr.max(axis=2) - minrgb) < 25)
+    bg_min = float(np.median(minrgb[grey])) if grey.any() else 255.0
+    min_size = max(120, int(H * W * 0.0006))
+    out = []
+    for y0 in range(H):
+        row = grid[y0]
+        for x0 in range(W):
+            c = row[x0]
+            if c < 0:
+                continue
+            # 같은 색으로 이어진 영역 채우기
+            row[x0] = -1
+            stack = [(x0, y0)]
+            pix = []
+            while stack:
+                x, y = stack.pop()
+                pix.append((x, y))
+                if x > 0 and grid[y][x - 1] == c:
+                    grid[y][x - 1] = -1; stack.append((x - 1, y))
+                if x < W - 1 and grid[y][x + 1] == c:
+                    grid[y][x + 1] = -1; stack.append((x + 1, y))
+                if y > 0 and grid[y - 1][x] == c:
+                    grid[y - 1][x] = -1; stack.append((x, y - 1))
+                if y < H - 1 and grid[y + 1][x] == c:
+                    grid[y + 1][x] = -1; stack.append((x, y + 1))
+            n = len(pix)
+            if n < min_size:
+                continue
+            cx = sum(p[0] for p in pix) / n
+            cy = sum(p[1] for p in pix) / n
+            cand = [p for p in pix if inner_l[p[1]][p[0]]] or pix
+            px, py = min(cand, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+            if colors is not None:
+                col = colors[c]
+            else:
+                samp = pix[:: max(1, n // 200)]
+                col = [int(sum(int(arr[b, a, k]) for a, b in samp) / len(samp))
+                       for k in range(3)]
+            name = ""
+            if read_names:
+                try:
+                    name = _zone_label_from_pixels(pix, minrgb, min(col), bg_min)
+                except Exception:
+                    name = ""
+            out.append({'color': col, 'fx': (px + 0.5) / W, 'fy': (py + 0.5) / H,
+                        'cx': cx / W, 'cy': cy / H, 'size': n, 'name': name})
+    # 위→아래, 왼→오 순
+    out.sort(key=lambda z: (round(z['cy'] * 12), z['cx']))
+    return out
+
+
+# 구역(색 덩어리) 안에 '갇힌' 밝은 픽셀 = 구역 이름 글자. 그 부분만 떼어 읽는다.
+def _zone_label_from_pixels(pix, minrgb, zone_min, bg_min=255):
+    xs = [p[0] for p in pix]; ys = [p[1] for p in pix]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    w, h = x1 - x0 + 3, y1 - y0 + 3                      # 테두리 1px 여유
+    comp = np.zeros((h, w), dtype=bool)
+    comp[np.array(ys) - y0 + 1, np.array(xs) - x0 + 1] = True
+    # 바깥에서 닿을 수 있는 곳을 채우고, 닿지 않는 곳(갇힌 곳)만 남긴다
+    reach = np.zeros((h, w), dtype=bool)
+    reach[0, :] = reach[-1, :] = reach[:, 0] = reach[:, -1] = True
+    free = ~comp
+    while True:
+        grow = reach.copy()
+        grow[1:, :] |= reach[:-1, :]; grow[:-1, :] |= reach[1:, :]
+        grow[:, 1:] |= reach[:, :-1]; grow[:, :-1] |= reach[:, 1:]
+        grow &= free
+        if (grow == reach).all():
+            break
+        reach = grow
+    enclosed = free & ~reach
+    if enclosed.sum() < 12:
+        return ""
+    H, W = minrgb.shape
+    sub = np.zeros((h, w), dtype=np.float64)
+    ya, yb = max(0, y0 - 1), min(H, y1 + 2)
+    xa, xb = max(0, x0 - 1), min(W, x1 + 2)
+    sub[ya - (y0 - 1):yb - (y0 - 1), xa - (x0 - 1):xb - (x0 - 1)] = minrgb[ya:yb, xa:xb]
+    # 글자가 구역 경계에 걸쳐 잘린 경우(일부만 갇힘)는 틀리게 읽히므로 포기한다.
+    # = 구역 바로 바깥 테두리에 배경보다 뚜렷이 밝은(흰 글자) 픽셀이 있는 경우.
+    # (배경 자체가 흰색인 배치도는 구분할 수 없으므로 이 검사를 생략)
+    near = np.zeros((h, w), dtype=bool)
+    near[1:, :] |= comp[:-1, :]; near[:-1, :] |= comp[1:, :]
+    near[:, 1:] |= comp[:, :-1]; near[:, :-1] |= comp[:, 1:]
+    edge = near & reach
+    if bg_min < 248:
+        n_white = int((edge & (sub >= bg_min + 0.4 * (255 - bg_min))).sum())
+        if n_white >= 2:
+            return ""
+    white = np.clip((sub - zone_min) / max(1.0, 255.0 - zone_min), 0, 1)
+    white[~enclosed] = 0
+    return read_zone_label(white)
+
+
+# ───────────────────────────────────────────────
+#  구역 이름 읽기 (배치도 그림 속 흰 글자 → 문자)
+# ───────────────────────────────────────────────
+# 외부 OCR 프로그램 없이, 시스템 글꼴로 만든 글자 견본과 모양을 비교해 읽는다.
+# 구역 이름은 보통 대문자 1글자(A) 또는 숫자 2~4자리(207)이며 회전돼 있기도 하다.
+_OCR_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_OCR_FONTS = ["arialbd.ttf", "malgunbd.ttf", "segoeuib.ttf", "tahomabd.ttf",
+              "FreeSansBold.ttf", "LiberationSans-Bold.ttf", "DejaVuSans-Bold.ttf"]
+_OCR_BOX = (20, 28)          # 글자 비교용 정규화 크기 (w, h)
+_ocr_templates = None
+# NOL 인터파크 배치도 글꼴에서 떼어 낸 글자 견본 (20x28 비트맵, 16진수)
+_OCR_SITE_TEMPLATES = {
+    '0': (0.778, '01f8007fe00fff01fff83fffc7f0fe7e07e7c03e7c03efc03ffc03ffc03ff801ff801ff801ff801ffc03ffc03ffc03f7c03e7c03e7e07e3f0fe3fffc1fff80fff007fe001f80'),
+    '1': (0.472, '003fc00ffe07ffe1fffe3fffeffffefe3fefc3fee03fe003fe003fe003fe003fe003fe001fe001fe001fe001fe001fe001ff001ff001ff001ff001ff001ff001ff001ff000fc'),
+    '2': (0.718, '03fc00fff01fff83fffc7fffe7e07efc03ffc03f7803f0003f0003e0007e000fc001fc003f8007f000fe001fc003f8007f001fe001fc003f800ffffffffffffffffffff7fffe'),
+    '3': (0.741, '01f800ffe01fff83fff87fffc7e0fe7c07e7803e0003e0007e0007c003f801ff001ff001ff801ffc000fe0003e0003f0003ff803ffc03ffe07f7fffe7fffc3fff80fff003fc0'),
+    '4': (0.815, '003f0007f0007f000ff000ff001ff001ff803ff803cf807cf8078f80f8f81f0f81f0f81e0f83e0f87c0f87c0f8fc1fcffffffffffffffffffff001f8000f8000f8000f8000f0'),
+    '5': (0.741, '3fffe3fffe3fffe3fffc3fffc3e0003e0003e0003c0003c7c07fff07fff87fffc7f1fe7e07e7c03f0003f0001f0001f7001ffc03ffc03ffe07e7fffe3fffc1fff80ffe001fc0'),
+    '6': (0.778, '01fc007ff00fff81fffc3fffe3f07e7e03e7e01efc000fc380fcff0fdff8ffffcffffeff0fefe07efc03ffc03ffc03ffc03f7c03e7e03f7e07e3fffc1fffc0fff807ff001fc0'),
+    '7': (0.694, '7fffffffffffffffffff7ffff0003f0007e0007e000fc000fc001f8003f8003f0003e0007e000fe000fc001f8001f8003f0003f0007f0007e000fc000fc001f8001f0003f000'),
+    '8': (0.753, '01f8007fe01fff83fff83fbfc7e07e7e07e7c03e7c03e7e07e3e07c1fff80fff007fe01fff83fff87e07e7c03efc03efc03ffc03ffc03ffe07e7fffe3fffc1fff80fff003fc0'),
+    '9': (0.747, '01f000ffe01fff03fff87fffc7e0fefc07efc03ef803ef803ff803ffc03ffc07f7e0ff7ffff3ffff1ffbf07c1f0003e0003e7803efc07e7e1fc7fff83fff81fff00ffc003f00'),
+    'A': (0.917, '00f8001f8001f8003fc003fc003fe003fe007fe007de0079f00f9f00f0f00f0f00f0f00f0f81f0f81e0f83fffc3fffc3fffc3fffc7fffc7c03e7c01e7801ef801ff801ff800f'),
+    'B': (0.778, '7ffc07fff0ffff8ffffcffffefc0fefc07efc03efc03efc03efc07cfc0fcffff0ffff0ffff8ffffcfc07efc03ffc03ffc03ffc03ffc03ffc07ffffffffffeffffcffff8ffff0'),
+    'C': (0.865, '01fc003ff00fff80fffc1fffc3f87e7e03f7e01f7c01f7c00f78000f8000f8000f8000f8000f8000f8000780007c00f7c01f7c01f7e03f3f07e1fffc0fffc07ff803fe000700'),
+    'D': (0.852, 'fff00fffc0fffe0ffff0ffff8f80f8f807cf803ef803ef803ef801ef801ff801ff801ff801ff801ff801ff801ef803ef803ef807ef80fcfc3f8ffff0ffff0fffe0fff007fc00'),
+    'E': (0.667, 'ffffffffffffffffffffffffffc000fc000fc000fc000fc000fc000ffffcffffcffffcffffcffffcfe000fc000fc000fc000fc000fc000fe000ffffffffffffffffffff7fffe'),
+    'F': (0.667, 'ffffffffffffffffffffffffffe000fe000fe000fe000fe000fe000ffffeffffeffffeffffeffffeff000fe000fe000fe000fe000fe000fe000fe000fe000fe000fc0007c000'),
+    'G': (0.889, '03fc007ff00fff81fffc3fffc3f07e7c03e7c03e7c01e78000f8000f0000f00fef01fff01fff01fff01fff801f7800f7c01f7c03e7c03e3f07e3fffc1fffc0fff807ff001fc0'),
+    'H': (0.861, 'f801ff801ff801ff801ff801ff801ff801ff801ff801ff801ff801ffc01ffffffffffffffffffffffc01ff801ff801ff801ff801ff801ff801ff801ff801ff801ff801ff801f'),
+    'I': (0.222, 'ffffcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc'),
+}
+
+
+def _ocr_norm(mask):
+    # 글자 하나의 2진 마스크 → (고정 크기로 늘린 모양, 가로/세로 비율)
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    m = mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    h, w = m.shape
+    im = Image.fromarray((m * 255).astype(np.uint8)).resize(_OCR_BOX, Image.BILINEAR)
+    return (np.asarray(im) > 127, w / float(h))
+
+
+def _ocr_load_templates():
+    global _ocr_templates
+    if _ocr_templates is not None:
+        return _ocr_templates
+    from PIL import ImageDraw, ImageFont
+    tpl = []                                   # [(char, mask, aspect), ...]
+    bw, bh = _OCR_BOX
+    for ch, (asp, hx) in _OCR_SITE_TEMPLATES.items():
+        bits = bin(int(hx, 16))[2:].zfill(bw * bh)
+        tpl.append((ch, np.array([b == '1' for b in bits]).reshape(bh, bw), asp))
+    for name in _OCR_FONTS:
+        try:
+            font = ImageFont.truetype(name, 64)
+        except Exception:
+            continue
+        for ch in _OCR_CHARS:
+            im = Image.new("L", (120, 120), 0)
+            ImageDraw.Draw(im).text((20, 20), ch, fill=255, font=font)
+            n = _ocr_norm(np.asarray(im) > 127)
+            if n is not None:
+                tpl.append((ch, n[0], n[1]))
+    _ocr_templates = tpl
+    return tpl
+
+
+def _ocr_char(mask, allowed):
+    n = _ocr_norm(mask)
+    if n is None:
+        return None, 0.0
+    shape, asp = n
+    best, score = None, 0.0
+    for ch, t, tasp in _ocr_load_templates():
+        if ch not in allowed:
+            continue
+        inter = np.logical_and(shape, t).sum()
+        union = np.logical_or(shape, t).sum()
+        s = inter / float(union) if union else 0.0
+        s -= 0.35 * abs(np.log(asp / tasp))        # 폭이 다른 글자(1 과 4 등) 구분
+        if s > score:
+            best, score = ch, s
+    return best, score
+
+
+def _ocr_line(mask):
+    # 가로로 놓인 글자줄 마스크 → (문자열, 평균 점수)
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 20:
+        return "", 0.0
+    mask = mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    h = mask.shape[0]
+    cols = mask.sum(axis=0) > 0
+    segs, start = [], None
+    for x, on in enumerate(list(cols) + [False]):
+        if on and start is None:
+            start = x
+        elif not on and start is not None:
+            if x - start >= max(2, h // 12):
+                segs.append((start, x))
+            start = None
+    if not segs or len(segs) > 4:
+        return "", 0.0
+    digits, letters = "0123456789", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    text, total = "", 0.0
+    for i, (a, b) in enumerate(segs):
+        if len(segs) == 1:
+            ch, sc = _ocr_char(mask[:, a:b], letters)          # 한 글자 구역 = 알파벳
+            ch2, sc2 = _ocr_char(mask[:, a:b], digits)
+            if sc2 > sc + 0.12:
+                ch, sc = ch2, sc2
+        else:
+            ch, sc = _ocr_char(mask[:, a:b], digits)           # 여러 글자 = 숫자
+            if i == 0:
+                ch2, sc2 = _ocr_char(mask[:, a:b], letters)    # 맨 앞만 알파벳 허용(A12)
+                if sc2 > sc + 0.12:
+                    ch, sc = ch2, sc2
+        if not ch:
+            return "", 0.0
+        text += ch
+        total += sc
+    return text, total / len(segs)
+
+
+# white: 구역 bbox 크기의 0~1 배열(글자일수록 1). 반환: 구역 이름 또는 ''
+def read_zone_label(white):
+    if white.max() <= 0:
+        return ""
+    ys, xs = np.nonzero(white > 0.5)
+    if len(xs) < 12:
+        return ""
+    # 글자줄의 기울기(주축) 추정
+    x = xs - xs.mean(); y = ys - ys.mean()
+    cov = np.array([[np.mean(x * x), np.mean(x * y)], [np.mean(x * y), np.mean(y * y)]])
+    vals, vecs = np.linalg.eigh(cov)
+    major = vecs[:, 1]
+    ang = float(np.degrees(np.arctan2(major[1], major[0])))
+    elong = (vals[1] / vals[0]) if vals[0] > 1e-6 else 99.0
+    angles = [0.0]
+    if elong > 1.25:
+        angles += [ang, ang + 180.0]
+    im = Image.fromarray((np.clip(white, 0, 1) * 255).astype(np.uint8))
+    scale = max(1, int(round(120.0 / max(im.size))))            # 작은 글자는 키워서
+    scale = min(scale, 6)
+    if scale > 1:
+        im = im.resize((im.width * scale, im.height * scale), Image.BICUBIC)
+    best, bscore = "", 0.0
+    for a in angles:
+        r = im if abs(a) < 0.5 else im.rotate(a, resample=Image.BICUBIC, expand=True)
+        text, sc = _ocr_line(np.asarray(r) > 127)
+        if a == 0.0:
+            sc += 0.03                                           # 동점이면 똑바른 쪽
+        if text and sc > bscore:
+            best, bscore = text, sc
+    return best if bscore >= 0.5 else ""
+
+
+# ───────────────────────────────────────────────
 #  신호 브릿지
 # ───────────────────────────────────────────────
 class Signals(QObject):
@@ -977,15 +1271,21 @@ class MacroThread(QThread):
             return rgb;
         }catch(e){ return null; }
     }
-    // 도형 안쪽의 클릭 가능한 점(뷰포트 좌표) 찾기
+    // 도형 안쪽 점(뷰포트 좌표) 찾기 - 도형의 실제 모양 기준(다른 요소에 가려져도 무관)
     function innerPoint(el, r){
         var pts=[[.5,.5],[.5,.3],[.5,.7],[.3,.5],[.7,.5],[.3,.3],[.7,.7],[.3,.7],[.7,.3],
                  [.5,.15],[.5,.85],[.15,.5],[.85,.5],[.2,.2],[.8,.8],[.2,.8],[.8,.2]];
+        var svg=el.ownerSVGElement, inv=null;
+        try{ inv=el.getScreenCTM().inverse(); }catch(e){}
         for(var i=0;i<pts.length;i++){
             var x=r.left+r.width*pts[i][0], y=r.top+r.height*pts[i][1];
-            if(document.elementFromPoint(x,y)===el) return [x,y];
+            if(!svg||!inv||!el.isPointInFill) return [x,y];
+            try{
+                var p=svg.createSVGPoint(); p.x=x; p.y=y;
+                if(el.isPointInFill(p.matrixTransform(inv))) return [x,y];
+            }catch(e){ return [x,y]; }
         }
-        return null;
+        return [r.left+r.width/2, r.top+r.height/2];
     }
     // 도형/상위 그룹의 속성에서 구역 이름 추출
     function labelOf(el, root){
@@ -1003,6 +1303,9 @@ class MacroThread(QThread):
                         cand.push(a.value);
                 }
             }
+            var idm=((n.getAttribute&&n.getAttribute('id'))||'').match(
+                /(?:block|zone|area|section|sector)[-_ ]?([A-Za-z0-9가-힣]{1,6})$/i);
+            if(idm) cand.push(idm[1]);
             for(var c=0;c<cand.length;c++){
                 var v=(cand[c]||'').replace(/\s+/g,' ').trim();
                 v=v.replace(/\s*(구역|영역|블록|block)$/i,'');
@@ -1031,8 +1334,6 @@ class MacroThread(QThread):
         if(r.width*r.height>area*0.6) continue;               // 배경
         var color=fillOf(el);
         if(!color) continue;
-        var pt=innerPoint(el,r);
-        if(!pt) continue;                                     // 가려졌거나 화면 밖
         if(!sample) sample=(el.parentElement&&el.parentElement!==best
                             ? el.parentElement.outerHTML : el.outerHTML).slice(0,400);
         var cx=(r.left+r.width/2-box.left)/box.width, cy=(r.top+r.height/2-box.top)/box.height;
@@ -1058,17 +1359,95 @@ class MacroThread(QThread):
     var el=document.querySelector('[data-macro-zone-shape="'+arguments[0]+'"]');
     if(!el) el=document.querySelector('[data-macro-zone="'+arguments[0]+'"]');
     if(!el) return null;
-    try{ el.scrollIntoView({block:'nearest',inline:'nearest'}); }catch(e){}
     var r=el.getBoundingClientRect();
     var pts=[[.5,.5],[.5,.3],[.5,.7],[.3,.5],[.7,.5],[.3,.3],[.7,.7],[.3,.7],[.7,.3],
              [.5,.15],[.5,.85],[.15,.5],[.85,.5],[.2,.2],[.8,.8],[.2,.8],[.8,.2]];
-    for(var i=0;i<pts.length;i++){
-        var x=r.left+r.width*pts[i][0], y=r.top+r.height*pts[i][1];
-        var top=document.elementFromPoint(x,y);
-        if(top===el || (top && el.contains(top))) return [x,y];
+    var svg=el.ownerSVGElement, inv=null;
+    try{ inv=el.getScreenCTM().inverse(); }catch(e){}
+    if(svg && inv && el.isPointInFill){
+        for(var i=0;i<pts.length;i++){
+            var x=r.left+r.width*pts[i][0], y=r.top+r.height*pts[i][1];
+            try{
+                var p=svg.createSVGPoint(); p.x=x; p.y=y;
+                if(el.isPointInFill(p.matrixTransform(inv))) return [x,y];
+            }catch(e){ break; }
+        }
     }
     return [r.left+r.width/2, r.top+r.height/2];
     """
+
+    # 좌석배치도 요소(가장 큰 svg/canvas/img) 찾기
+    _JS_ONESTOP_MAP = r"""
+    var best=null, area=0;
+    var c=document.querySelectorAll('svg,canvas,img');
+    for(var i=0;i<c.length;i++){
+        var b=c[i].getBoundingClientRect();
+        if(b.width*b.height>area){ area=b.width*b.height; best=c[i]; }
+    }
+    if(!best || area<40000) return null;
+    var r=best.getBoundingClientRect();
+    return {el:best, left:r.left, top:r.top, width:r.width, height:r.height,
+            html:(best.outerHTML||'').slice(0,300000)};
+    """
+
+    # 배치도를 화면에 보이는 그림 그대로 캡처해 색 덩어리(구역)로 나눈다.
+    # svg 안의 <image>, <img> 파일, canvas 로 그려진 배치도 모두 대응.
+    def _scan_onestop_image(self):
+        drv = self.driver
+        try:
+            m = drv.execute_script(self._JS_ONESTOP_MAP)
+        except Exception:
+            m = None
+        if not m or not m.get('el'):
+            return []
+        self._onestop_map_html = m.get('html') or ''
+        try:
+            im = Image.open(io.BytesIO(m['el'].screenshot_as_png)).convert("RGB")
+        except Exception:
+            return []
+        # 너무 크면 줄여서 처리 (경계선이 사라지지 않을 정도로만)
+        if im.width > 1100:
+            k = 1100.0 / im.width
+            im = im.resize((1100, max(1, int(im.height * k))), Image.NEAREST)
+        palette = [c for c in (getattr(self, '_grade_palette', None) or []) if c]
+        try:
+            segs = segment_zone_image(im, palette or None)
+        except Exception:
+            segs = []
+        H3 = ['왼쪽', '가운데', '오른쪽']; V3 = ['위', '중간', '아래']
+        zones = []
+        names = [z.get('name') or '' for z in segs]
+        for i, z in enumerate(segs, 1):
+            name = z.get('name') or ''
+            if name and names.count(name) > 1:
+                name = ''                      # 같은 이름이 둘이면 잘못 읽은 것
+            zones.append({
+                'label': name or 'Z%d' % i, 'color': z['color'], 'named': bool(name),
+                'hint': H3[min(2, int(z['cx'] * 3))] + ' ' + V3[min(2, int(z['cy'] * 3))],
+                'fx': z['fx'], 'fy': z['fy'], 'src': 'onestop', 'href': ''})
+        return zones
+
+    # 화면 좌표를 실제 마우스로 클릭
+    def _click_viewport_point(self, x, y):
+        drv = self.driver
+        x, y = int(round(x)), int(round(y))
+        try:
+            ac = ActionChains(drv)
+            ac.w3c_actions.pointer_action.move_to_location(x, y)
+            ac.w3c_actions.pointer_action.click()
+            ac.perform()
+            return True
+        except Exception:
+            pass
+        try:
+            drv.execute_script(
+                "var x=arguments[0],y=arguments[1];var e=document.elementFromPoint(x,y);"
+                "if(!e)return;['pointerdown','mousedown','pointerup','mouseup','click']"
+                ".forEach(function(t){e.dispatchEvent(new MouseEvent(t,{bubbles:true,"
+                "cancelable:true,view:window,clientX:x,clientY:y}));});", x, y)
+            return True
+        except Exception:
+            return False
 
     def _scan_onestop_shapes(self):
         drv = self.driver
@@ -1110,9 +1489,16 @@ class MacroThread(QThread):
         if not res:
             # 구역 번호가 글자로 없으면 배치도의 색칠된 도형을 구역으로 읽는다
             shapes = self._scan_onestop_shapes()
+            if shapes and all(z.get('named') for z in shapes):
+                return shapes
+            # 배치도를 그림으로 캡처해 색 덩어리로 구역을 나누고 이름(글자)을 읽는다
+            imgz = self._scan_onestop_image()
+            if imgz:
+                return imgz
             if shapes:
                 return shapes          # 화면 위치 순서 유지
-        if not res:
+        if not res and not getattr(self, '_dumped', False):
+            self._dumped = True        # 진단 저장은 한 번만
             self._dump_page("onestop_dump.html")
             if info:
                 self.log(f"[진단] 배치도={info.get('map')}, svg={info.get('svgs')}, "
@@ -1142,33 +1528,93 @@ class MacroThread(QThread):
         return out
 
     # 구역 라벨을 실제 마우스로 클릭 (React 이벤트가 확실히 발생하도록)
-    def _click_onestop_zone(self, label):
+    def _click_onestop_zone(self, label, zone=None):
         drv = self.driver
+        # 1) 그림으로 읽은 구역: 배치도 안 상대 위치로 클릭
+        if isinstance(zone, dict) and zone.get('fx') is not None:
+            try:
+                m = drv.execute_script(self._JS_ONESTOP_MAP)
+            except Exception:
+                m = None
+            if not m:
+                return False
+            return self._click_viewport_point(m['left'] + m['width'] * zone['fx'],
+                                              m['top'] + m['height'] * zone['fy'])
+        # 2) DOM 에서 읽은 구역: 표시해 둔 요소의 안쪽 점 클릭
         try:
             pt = drv.execute_script(self._JS_ONESTOP_POINT, label)
         except Exception:
             pt = None
         if not pt:
             return False
-        x, y = int(round(pt[0])), int(round(pt[1]))
+        return self._click_viewport_point(pt[0], pt[1])
+
+    # 구역 번호를 읽을 수 없는 배치도: 목록 번호를 배치도 위에 번호표로 표시해
+    # 어떤 번호가 어느 구역인지 눈으로 확인할 수 있게 한다. (클릭은 통과시킴)
+    def _show_zone_badges(self, zone_list):
+        drv = self.driver
         try:
-            ac = ActionChains(drv)
-            ac.w3c_actions.pointer_action.move_to_location(x, y)
-            ac.w3c_actions.pointer_action.click()
-            ac.perform()
-            return True
+            m = drv.execute_script(self._JS_ONESTOP_MAP)
         except Exception:
-            pass
-        # 폴백: 그 좌표의 요소에 마우스 이벤트 직접 발생
+            m = None
+        pts = []
+        for i, z in zone_list:          # [(목록 번호, 구역), ...]
+            try:
+                if z.get('fx') is not None and m:
+                    pts.append([i, m['left'] + m['width'] * z['fx'],
+                                m['top'] + m['height'] * z['fy']])
+                else:
+                    pt = drv.execute_script(self._JS_ONESTOP_POINT, z.get('label', ''))
+                    if pt:
+                        pts.append([i, pt[0], pt[1]])
+            except Exception:
+                continue
+        js = r"""
+        var old=document.getElementById('macro-zone-badges'); if(old) old.remove();
+        var wrap=document.createElement('div'); wrap.id='macro-zone-badges';
+        wrap.style.cssText='position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none;';
+        var pts=arguments[0];
+        for(var i=0;i<pts.length;i++){
+            var b=document.createElement('div');
+            b.textContent=pts[i][0];
+            b.style.cssText='position:fixed;transform:translate(-50%,-50%);pointer-events:none;'+
+              'background:#111;color:#ff0;font:bold 13px/1 Arial,sans-serif;padding:3px 5px;'+
+              'border-radius:9px;border:1px solid #ff0;left:'+pts[i][1]+'px;top:'+pts[i][2]+'px;';
+            wrap.appendChild(b);
+        }
+        document.body.appendChild(wrap);
+        return pts.length;
+        """
         try:
-            drv.execute_script(
-                "var x=arguments[0],y=arguments[1];var e=document.elementFromPoint(x,y);"
-                "if(!e)return;['pointerdown','mousedown','pointerup','mouseup','click']"
-                ".forEach(function(t){e.dispatchEvent(new MouseEvent(t,{bubbles:true,"
-                "cancelable:true,view:window,clientX:x,clientY:y}));});", x, y)
-            return True
+            return bool(drv.execute_script(js, pts))
         except Exception:
             return False
+
+    def _hide_zone_badges(self):
+        try:
+            self.driver.execute_script(
+                "var o=document.getElementById('macro-zone-badges'); if(o) o.remove();")
+        except Exception:
+            pass
+
+    # 배치도 요소의 HTML만 따로 저장 (구역 이름을 읽는 방법 파악용, 개인정보 없음)
+    def _save_map_html(self):
+        html = getattr(self, '_onestop_map_html', '')
+        if not html:
+            try:
+                m = self.driver.execute_script(self._JS_ONESTOP_MAP) or {}
+                html = m.get('html') or ''
+            except Exception:
+                html = ''
+        if not html:
+            return
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])),
+                                "onestop_map.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)
+        except Exception:
+            pass
 
     # 구조 파악용으로 현재 페이지 HTML을 파일로 저장
     def _dump_page(self, name):
@@ -1180,6 +1626,56 @@ class MacroThread(QThread):
         except Exception:
             pass
 
+    # ── 신형 onestop: 구역 목록 표시 + 선택 ────
+    # 형식:  1. 모두 / 2. A / 3. B ... / 11. 207 ...
+    def _choose_onestop_zones(self, zone_list):
+        def key(z):
+            lbl = z.get('label', '')
+            if not z.get('named', True):
+                return (2, 0, '')                       # 이름 못 읽은 구역은 맨 뒤
+            if lbl.isdigit():
+                return (1, int(lbl), lbl)               # 숫자 구역: 오름차순
+            return (0, 0, lbl)                          # 알파벳 구역 먼저
+        zone_list = sorted(zone_list, key=key)          # (안정 정렬: 같은 순위는 화면 순서)
+        self.log("좌석 구역을 선택해주세요")
+        self.log("1. 모두")
+        unnamed = []
+        for i, z in enumerate(zone_list, 2):
+            if z.get('named', True):
+                self.log(f"{i}. {z.get('label', '')}")
+            else:
+                z['disp'] = f"{i}번 구역"
+                unnamed.append((i, z))
+                self.log(f"{i}. (이름을 못 읽은 구역 - 배치도의 번호표 {i})")
+        if unnamed and self._show_zone_badges(unnamed):
+            self.log("※ 이름을 못 읽은 구역은 배치도 위에 노란 번호표로 표시했습니다.")
+        self.log("번호 입력(','로 여러개). 1 또는 그냥 Enter = 모두")
+        ans = self._ask(timeout=120)
+        self._hide_zone_badges()
+        if not ans:
+            return zone_list
+        self.log(f"→ {ans}")
+        by_name = {z.get('label', '').upper(): z for z in zone_list if z.get('named', True)}
+        selected = []
+        for part in ans.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            z = None
+            if part.isdigit():
+                n = int(part)
+                if n == 1:
+                    return zone_list                    # 모두
+                if 2 <= n <= len(zone_list) + 1:
+                    z = zone_list[n - 2]
+            if z is None:
+                z = by_name.get(part.upper())           # 구역 이름을 직접 입력한 경우
+            if z is None:
+                self.log(f"'{part}' 은(는) 목록에 없어 건너뜁니다.")
+            elif z not in selected:
+                selected.append(z)
+        return selected if selected else zone_list
+
     # ── 구역 선택 (등급 클릭 후 펼쳐진 구역만 표시; 색 미사용) ──
     def _ask_zones(self, grade=None, grade_list=None):
         gname = (grade or {}).get('name', '')
@@ -1188,7 +1684,10 @@ class MacroThread(QThread):
             # 등급 별 가격 패널이 배치도를 가릴 수 있으니 닫고 읽는다
             self._close_price_panel()
             self._wait(0.3)
+            self._grade_palette = [g.get('color') for g in (grade_list or [])
+                                   if g.get('color')]
             all_zones = self._scan_onestop_zones()
+            self._save_map_html()
         else:
             all_zones = self._get_zones()
         zone_list = all_zones
@@ -1231,6 +1730,8 @@ class MacroThread(QThread):
                 self.log(f"'{gname}' 구역 매핑을 못 읽음 → 전체 구역 표시")
                 zone_list = all_zones
 
+        if onestop and zone_list:
+            return self._choose_onestop_zones(zone_list)
         unnamed = onestop and any(z.get('hint') and not z.get('named') for z in zone_list)
         if not unnamed:
             zone_list = self._sort_zones(zone_list)
@@ -1246,8 +1747,14 @@ class MacroThread(QThread):
                     self.log(f"{i}. {lbl}")
                 else:
                     self.log(f"{i}. {lbl}" + ("구역" if onestop else "영역"))
+        if unnamed and zone_list:
+            for i, z in enumerate(zone_list, 1):
+                z['disp'] = f"{i}번"
+            if self._show_zone_badges(list(enumerate(zone_list, 1))):
+                self.log("※ 배치도 위에 노란 번호표로 목록 번호를 표시했습니다.")
         self.log("구역 번호 입력(','로 여러개). 그냥 Enter 시 전체 구역을 순회합니다.")
         ans = self._ask(timeout=120)
+        self._hide_zone_badges()
         if not ans:
             return zone_list            # 전체 구역 순회
         self.log(f"→ {ans}")
@@ -1610,12 +2117,17 @@ class MacroThread(QThread):
         try: drv.switch_to.default_content()
         except Exception: pass
         if self._is_onestop():
-            if self._click_onestop_zone(zone_num):
+            zd = zone if isinstance(zone, dict) else None
+            if self._click_onestop_zone(zone_num, zd):
                 return True
             # 화면이 다시 그려져 표시가 사라졌으면 다시 스캔 후 재시도
-            self._scan_onestop_zones()
-            if self._click_onestop_zone(zone_num):
-                return True
+            for z in self._scan_onestop_zones():
+                if z.get('label') == zone_num:
+                    return self._click_onestop_zone(zone_num, z)
+            if zone_num not in getattr(self, '_zone_warned', set()):
+                self._zone_warned = getattr(self, '_zone_warned', set()) | {zone_num}
+                self.log(f"'{zone_num}' 구역을 배치도에서 찾지 못했습니다 (건너뜀)")
+            return False
         if self._click_zone_recursive(zone_num, href, 0):
             return True
         try: drv.switch_to.default_content()
@@ -1760,6 +2272,7 @@ class MacroThread(QThread):
                 try:
                     # 구역 클릭 (실패해도 다음 구역으로). zone 은 dict 또는 문자열.
                     if not self._click_zone(zone):
+                        self._wait(0.3)     # 클릭 실패가 이어져도 헛돌지 않게
                         continue
 
                     self._wait(self.delay)
@@ -2039,7 +2552,7 @@ class MacroThread(QThread):
 
             # ⑤ 구역 선택 (zones = 구역 dict 리스트)
             zones = self._ask_zones(grade, grade_list)
-            zone_labels = [z.get('label', '') for z in zones] if zones else []
+            zone_labels = [z.get('disp') or z.get('label', '') for z in zones] if zones else []
             self.log(f"선택 구역: {', '.join(zone_labels) if zone_labels else '전체'} "
                      f"({len(zones)}개)")
             self._wait(0.3)
