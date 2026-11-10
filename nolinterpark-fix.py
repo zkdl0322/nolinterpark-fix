@@ -1929,6 +1929,30 @@ class MacroThread(QThread):
                      "배치도 오른쪽 아래 [화면 맞춤] 버튼을 직접 눌러 주세요.")
         return False
 
+    # 화면 좌표에 있는 요소에 포인터/마우스 이벤트를 순서대로 직접 발생시킨다.
+    # (실제 마우스 클릭이 반영되지 않는 화면을 위한 두 번째 방법)
+    def _dispatch_click_at(self, x, y):
+        js = r"""
+        var x=arguments[0], y=arguments[1];
+        var e=document.elementFromPoint(x,y);
+        if(!e) return false;
+        var o={bubbles:true,cancelable:true,composed:true,view:window,clientX:x,clientY:y,
+               screenX:x,screenY:y,button:0,buttons:1,pointerId:1,pointerType:'mouse',isPrimary:true};
+        var seq=[['pointerover',1],['pointerenter',1],['mouseover',0],['pointermove',1],
+                 ['mousemove',0],['pointerdown',1],['mousedown',0],['pointerup',1],
+                 ['mouseup',0],['click',0]];
+        for(var i=0;i<seq.length;i++){
+            var ev = (seq[i][1] && window.PointerEvent)
+                ? new PointerEvent(seq[i][0], o) : new MouseEvent(seq[i][0], o);
+            e.dispatchEvent(ev);
+        }
+        return true;
+        """
+        try:
+            return bool(self.driver.execute_script(js, x, y))
+        except Exception:
+            return False
+
     # 좌석 화면에서 선택 등급 색의 예매 가능 좌석을 찾아 클릭한다.
     def _click_onestop_seat(self, grade=None):
         if self._seat_selected() is True:
@@ -1988,14 +2012,30 @@ class MacroThread(QThread):
             if covered:
                 continue
             tried += 1
-            self._click_viewport_point(x, y)
-            # 선택 반영(서버 응답)을 잠깐 기다린다 — 성급히 다른 좌석을 또 누르지 않게
-            for _ in range(8):
-                self._wait(0.2)
-                self._accept_alert()
-                if self._seat_selected() is True:
-                    self.log("→ 좌석 선택 성공")
-                    return True
+            # 진단용: 그 자리에 실제로 어떤 요소가 있는지 (처음 몇 번만 기록)
+            if getattr(self, '_seat_diag', 0) < 3:
+                self._seat_diag = getattr(self, '_seat_diag', 0) + 1
+                try:
+                    what = drv.execute_script(
+                        "var e=document.elementFromPoint(arguments[0],arguments[1]);"
+                        "if(!e)return 'none';var c=e.getAttribute('class')||'';"
+                        "return e.tagName+(c?'.'+c.slice(0,40):'');", x, y)
+                except Exception:
+                    what = '?'
+                self.log(f"[진단] 좌석 클릭 위치 ({int(x)},{int(y)}) 대상={what}")
+            # 1) 실제 마우스 클릭  2) 안 되면 같은 자리에 클릭 이벤트를 직접 발생
+            for how in ("mouse", "event"):
+                if how == "mouse":
+                    self._click_viewport_point(x, y)
+                else:
+                    self._dispatch_click_at(x, y)
+                # 선택 반영(서버 응답)을 잠깐 기다린다 — 성급히 또 누르지 않게
+                for _ in range(8):
+                    self._wait(0.2)
+                    self._accept_alert()
+                    if self._seat_selected() is True:
+                        self.log("→ 좌석 선택 성공")
+                        return True
         if tried:
             self.log("좌석을 눌렀지만 선택되지 않았습니다 (다음 구역으로)")
         return False
