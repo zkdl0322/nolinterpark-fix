@@ -290,6 +290,25 @@ class MacroThread(QThread):
         if self._click_text_button(["가격닫기"]):
             self._wait(0.4)
             return True
+        # 1-2) 신형 onestop: '등급 별 가격' 팝업은 다시 누르면 닫힌다(토글)
+        if self._is_onestop():
+            js = r"""
+            var nodes=document.querySelectorAll('div,ul,section,aside');
+            for(var i=0;i<nodes.length;i++){
+                var t=(nodes[i].textContent||'');
+                if(/\d[\d,]*\s*원/.test(t) && /석/.test(t) && t.length<300
+                   && nodes[i].getBoundingClientRect().width>0) return true;
+            }
+            return false;
+            """
+            try:
+                opened = bool(self.driver.execute_script(js))
+            except Exception:
+                opened = False
+            if opened and self._click_text_button(["등급별가격"]):
+                self._wait(0.4)
+                return True
+            return False
         # 2) JS로 가격 패널 요소 직접 숨김 (폴백)
         js = r"""
         var sels=['.price_view','.seat_price','[class*="priceView"]',
@@ -797,13 +816,197 @@ class MacroThread(QThread):
         else:
             self.log(f"[진단] '{gname}' 패널 요소를 못 찾음")
 
+    # ── 신형 onestop 좌석 페이지 (tickets.interpark.com/onestop/seat) ──
+    def _is_onestop(self):
+        return "/onestop" in self._url()
+
+    # 좌석배치도(가장 큰 SVG/캔버스 영역) 안의 구역 라벨(314, A 등)을 찾고,
+    # 라벨 위치 아래에 깔린 도형의 채움색을 구역 색으로 읽는다.
+    # 찾은 라벨 요소에는 data-macro-zone 속성을 붙여 나중에 클릭할 때 쓴다.
+    _JS_ONESTOP_ZONES = r"""
+    function toRGB(s){
+        if(!s||s==='none'||s==='transparent') return null;
+        var m=s.match(/(\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?/);
+        if(m){ if(m[4]!==undefined && +m[4]===0) return null;
+               return [+m[1],+m[2],+m[3]]; }
+        var h=s.replace(/^#/,'');
+        if(h.length===3) h=h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+        if(/^[0-9a-f]{6}$/i.test(h)) return [parseInt(h.slice(0,2),16),
+            parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
+        return null;
+    }
+    function fillOf(el){
+        try{
+            var cs=getComputedStyle(el);
+            var c=[el.getAttribute&&el.getAttribute('fill'), cs.fill, cs.backgroundColor];
+            for(var k=0;k<c.length;k++){
+                var rgb=toRGB(c[k]||'');
+                if(!rgb) continue;
+                var r=rgb[0],g=rgb[1],b=rgb[2];
+                if(r>240&&g>240&&b>240) continue;          // 흰색/배경
+                return rgb;
+            }
+        }catch(e){}
+        return null;
+    }
+    function vis(el){
+        var b=el.getBoundingClientRect();
+        return b.width>0&&b.height>0;
+    }
+    // 1) 좌석배치도 컨테이너: 화면에서 가장 큰 svg (없으면 canvas)
+    var best=null, area=0;
+    var cands=document.querySelectorAll('svg,canvas');
+    for(var i=0;i<cands.length;i++){
+        var b=cands[i].getBoundingClientRect();
+        var a=b.width*b.height;
+        if(a>area){ area=a; best=cands[i]; }
+    }
+    var box = best ? best.getBoundingClientRect() : null;
+    // 아이콘 같은 작은 svg 뿐이면 배치도가 아님 → 영역 필터 생략
+    if(area < 40000) box = null;
+    var LABEL=/^(?:[A-Z]|[A-Z]?[1-9]\d{0,3}|[가-힣]{1,2}\d{0,3})$/;
+    var SKIP={'STAGE':1,'FOH':1};
+    var out=[], seen={};
+    var nodes=document.querySelectorAll('text,tspan,span,div,p,strong,b,button');
+    for(var i=0;i<nodes.length;i++){
+        var el=nodes[i];
+        if(el.children && el.children.length>0 &&
+           (el.tagName||'').toLowerCase()!=='text') continue;  // 잎 노드만
+        var t=(el.textContent||'').replace(/\s+/g,'');
+        if(!t || SKIP[t] || !LABEL.test(t) || seen[t]) continue;
+        if(!vis(el)) continue;
+        var r=el.getBoundingClientRect();
+        var cx=r.left+r.width/2, cy=r.top+r.height/2;
+        // 좌석배치도 영역 밖(헤더 날짜/시간 등)은 제외
+        if(box && (cx<box.left||cx>box.right||cy<box.top||cy>box.bottom)) continue;
+        // 라벨 아래 깔린 도형의 색
+        var color=null, shape=null;
+        var stack=document.elementsFromPoint(cx,cy)||[];
+        for(var k=0;k<stack.length;k++){
+            var s=stack[k];
+            if(s===el || el.contains(s)) continue;
+            var tg=(s.tagName||'').toLowerCase();
+            if(tg==='text'||tg==='tspan'||tg==='svg'||tg==='html'||tg==='body') continue;
+            var c=fillOf(s);
+            if(c){ color=c; shape=s; break; }
+        }
+        seen[t]=1;
+        el.setAttribute('data-macro-zone', t);
+        if(shape) shape.setAttribute('data-macro-zone-shape', t);
+        out.push({label:t, color:color, x:cx, y:cy});
+    }
+    return {zones:out, map:best?(best.tagName+' '+Math.round(Math.sqrt(area))+'^2'):null,
+            svgs:document.querySelectorAll('svg').length,
+            canvas:document.querySelectorAll('canvas').length};
+    """
+
+    def _scan_onestop_zones(self):
+        drv = self.driver
+        try: drv.switch_to.default_content()
+        except Exception: pass
+        res = []
+        info = None
+        def fn():
+            nonlocal info
+            try:
+                r = drv.execute_script(self._JS_ONESTOP_ZONES) or {}
+            except Exception:
+                return []
+            zs = r.get('zones') or []
+            if zs or info is None:
+                info = r
+            return zs
+        res = self._collect_all_frames(fn)
+        try: drv.switch_to.default_content()
+        except Exception: pass
+        for z in res:
+            z['src'] = 'onestop'
+            z['href'] = ''
+        if not res:
+            self._dump_page("onestop_dump.html")
+            if info:
+                self.log(f"[진단] 배치도={info.get('map')}, svg={info.get('svgs')}, "
+                         f"canvas={info.get('canvas')}")
+        return self._sort_zones(self._dedup_zones(res))
+
+    # 구역 색과 등급 범례 색을 비교해 '가장 가까운 등급'이 선택 등급인 구역만 남긴다.
+    def _filter_zones_by_grade(self, zones, grade, grade_list):
+        tgt = (grade or {}).get('color')
+        if not tgt:
+            return None
+        palette = [g.get('color') for g in (grade_list or []) if g.get('color')]
+        if tgt not in palette:
+            palette.append(tgt)
+
+        def dist(a, b):
+            return sum(abs(a[i] - b[i]) for i in range(3))
+
+        out = []
+        for z in zones:
+            c = z.get('color')
+            if not c:
+                continue
+            near = min(palette, key=lambda p: dist(p, c))
+            if near == tgt and dist(c, tgt) <= 120:
+                out.append(z)
+        return out
+
+    # 구역 라벨을 실제 마우스로 클릭 (React 이벤트가 확실히 발생하도록)
+    def _click_onestop_zone(self, label):
+        drv = self.driver
+        for attr in ("data-macro-zone", "data-macro-zone-shape"):
+            try:
+                els = drv.find_elements(By.CSS_SELECTOR, '[%s="%s"]' % (attr, label))
+            except Exception:
+                els = []
+            for el in els:
+                try:
+                    ActionChains(drv).move_to_element(el).click().perform()
+                    return True
+                except Exception:
+                    try:
+                        drv.execute_script(
+                            "var e=arguments[0];['pointerdown','mousedown','pointerup',"
+                            "'mouseup','click'].forEach(function(t){e.dispatchEvent("
+                            "new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));});",
+                            el)
+                        return True
+                    except Exception:
+                        continue
+        return False
+
+    # 구조 파악용으로 현재 페이지 HTML을 파일로 저장
+    def _dump_page(self, name):
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), name)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+            self.log(f"[진단] 페이지 구조를 저장했습니다: {path}")
+        except Exception:
+            pass
+
     # ── 구역 선택 (등급 클릭 후 펼쳐진 구역만 표시; 색 미사용) ──
     def _ask_zones(self, grade=None, grade_list=None):
         gname = (grade or {}).get('name', '')
-        all_zones = self._get_zones()
+        onestop = self._is_onestop()
+        if onestop:
+            # 등급 별 가격 패널이 배치도를 가릴 수 있으니 닫고 읽는다
+            self._close_price_panel()
+            self._wait(0.3)
+            all_zones = self._scan_onestop_zones()
+        else:
+            all_zones = self._get_zones()
         zone_list = all_zones
 
-        if gname:
+        if onestop:
+            if gname:
+                zs = self._filter_zones_by_grade(all_zones, grade, grade_list)
+                if zs:
+                    zone_list = zs
+                    self.log(f"[{gname}] 구역 {len(zone_list)}개 (색상으로 매핑)")
+                else:
+                    self.log(f"'{gname}' 구역 매핑을 못 읽음 → 전체 구역 표시")
+        elif gname:
             # 1) 좌석등급 패널에서 선택 등급을 클릭해 펼친 뒤 구역을 읽는다
             zs = self._get_zones_for_grade(gname)
             # 2) 비면 '가격 전체보기'를 열고 재시도
@@ -834,7 +1037,10 @@ class MacroThread(QThread):
         else:
             for i, z in enumerate(zone_list, 1):
                 lbl = z.get('label', '')
-                self.log(f"{i}. {lbl if '영역' in lbl else lbl + '영역'}")
+                if '영역' in lbl or '구역' in lbl:
+                    self.log(f"{i}. {lbl}")
+                else:
+                    self.log(f"{i}. {lbl}" + ("구역" if onestop else "영역"))
         self.log("구역 번호 입력(','로 여러개). 그냥 Enter 시 전체 구역을 순회합니다.")
         ans = self._ask(timeout=120)
         if not ans:
@@ -1198,6 +1404,13 @@ class MacroThread(QThread):
         drv = self.driver
         try: drv.switch_to.default_content()
         except Exception: pass
+        if self._is_onestop():
+            if self._click_onestop_zone(zone_num):
+                return True
+            # 화면이 다시 그려져 표시가 사라졌으면 다시 스캔 후 재시도
+            self._scan_onestop_zones()
+            if self._click_onestop_zone(zone_num):
+                return True
         if self._click_zone_recursive(zone_num, href, 0):
             return True
         try: drv.switch_to.default_content()
