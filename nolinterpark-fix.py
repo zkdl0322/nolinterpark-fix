@@ -1970,19 +1970,24 @@ class MacroThread(QThread):
         random.shuffle(seats)
         self.log(f"예매 가능 좌석 {len(seats)}개 발견 → 클릭 시도")
         drv = self.driver
-        for st in seats[:3]:
+        tried = 0
+        for st in seats:
+            if tried >= 3:
+                break
             x = m['left'] + m['width'] * st['fx']
             y = m['top'] + m['height'] * st['fy']
-            # 그 자리에 다른 요소(버튼, 패널 등)가 덮여 있으면 건너뜀
+            # 그 자리를 버튼(+, -, 등급 별 가격 등)이 덮고 있을 때만 건너뜀.
+            # (좌석은 배치도 그림과 다른 층에 그려질 수 있으므로 그 외에는 그대로 누른다)
             try:
-                on_map = drv.execute_script(
-                    "var e=document.elementFromPoint(arguments[1],arguments[2]);"
-                    "var m=arguments[0];return !!e && (e===m || m.contains(e) || e.contains(m));",
-                    m['el'], x, y)
+                covered = drv.execute_script(
+                    "var e=document.elementFromPoint(arguments[0],arguments[1]);"
+                    "return !!(e && e.closest && e.closest('button,a,[role=\"button\"],input'));",
+                    x, y)
             except Exception:
-                on_map = True
-            if not on_map:
+                covered = False
+            if covered:
                 continue
+            tried += 1
             self._click_viewport_point(x, y)
             # 선택 반영(서버 응답)을 잠깐 기다린다 — 성급히 다른 좌석을 또 누르지 않게
             for _ in range(8):
@@ -1991,7 +1996,8 @@ class MacroThread(QThread):
                 if self._seat_selected() is True:
                     self.log("→ 좌석 선택 성공")
                     return True
-        self.log("좌석을 눌렀지만 선택되지 않았습니다 (다음 구역으로)")
+        if tried:
+            self.log("좌석을 눌렀지만 선택되지 않았습니다 (다음 구역으로)")
         return False
 
     # ── 신형 onestop: 구역 목록 표시 + 선택 ────
