@@ -724,19 +724,39 @@ class MacroThread(QThread):
             if (!name || name.length<2 || seen[name]) continue;
             // '등급 별 가격' 버튼 문구가 섞인 행, 안내 문구 제외
             if (/가격|선택해/.test(name)) continue;
-            // 색상 swatch (배경색) 찾기
-            var color = null;
-            var scan = [el].concat([].slice.call(el.querySelectorAll('*')));
-            for (var j=0;j<scan.length;j++){
-                var cs = getComputedStyle(scan[j]);
-                var bg = cs.backgroundColor||'';
-                var m = bg.match(/(\d+),\s*(\d+),\s*(\d+)/);
-                if (m){
-                    var r=+m[1],g=+m[2],b=+m[3];
-                    if (r>245&&g>245&&b>245) continue;   // 흰색 제외
-                    if (r<12&&g<12&&b<12) continue;      // 검정 제외
-                    color = [r,g,b]; break;
+            // 색상 swatch(등급 색 점) 찾기: 회색 구분선/배경이 아닌 '유채색'만 인정.
+            // 배경색, SVG fill, ::before/::after 를 모두 보고, 행 안에 없으면
+            // 같은 등급 행으로 보이는 상위 요소까지 올라가며 찾는다.
+            function sat(s){
+                var m=(s||'').match(/(\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?/);
+                if(!m) return null;
+                if(m[4]!==undefined && +m[4]===0) return null;
+                var r=+m[1],g=+m[2],b=+m[3];
+                if(Math.max(r,g,b)-Math.min(r,g,b)<40) return null;   // 흰/회/검정
+                return [r,g,b];
+            }
+            function swatch(root){
+                var scan=[root].concat([].slice.call(root.querySelectorAll('*')));
+                for(var j=0;j<scan.length;j++){
+                    var e=scan[j], c=null;
+                    try{
+                        var cs=getComputedStyle(e);
+                        c=sat(cs.backgroundColor);
+                        if(!c && e instanceof SVGElement) c=sat(cs.fill);
+                        if(!c) c=sat(getComputedStyle(e,'::before').backgroundColor);
+                        if(!c) c=sat(getComputedStyle(e,'::after').backgroundColor);
+                    }catch(err){}
+                    if(c) return c;
                 }
+                return null;
+            }
+            var color = swatch(el);
+            var up = el.parentElement;
+            for(var d=0; !color && up && d<4; d++){
+                var pt=(up.textContent||'').replace(/\s+/g,' ').trim();
+                if(pt.length>40 || (pt.match(/\d[\d,]*\s*원/g)||[]).length!==1) break;
+                color = swatch(up);
+                up = up.parentElement;
             }
             seen[name]=1;
             out.push({name:name, color:color});
@@ -1409,9 +1429,9 @@ class MacroThread(QThread):
         if im.width > 1100:
             k = 1100.0 / im.width
             im = im.resize((1100, max(1, int(im.height * k))), Image.NEAREST)
-        palette = [c for c in (getattr(self, '_grade_palette', None) or []) if c]
         try:
-            segs = segment_zone_image(im, palette or None)
+            # 등급 색에 기대지 않고 배치도에 실제로 칠해진 색 그대로 구역을 나눈다
+            segs = segment_zone_image(im, None)
         except Exception:
             segs = []
         H3 = ['왼쪽', '가운데', '오른쪽']; V3 = ['위', '중간', '아래']
@@ -1506,26 +1526,131 @@ class MacroThread(QThread):
         return self._sort_zones(self._dedup_zones(res))
 
     # 구역 색과 등급 범례 색을 비교해 '가장 가까운 등급'이 선택 등급인 구역만 남긴다.
+    @staticmethod
+    def _cdist(a, b):
+        return sum(abs(a[i] - b[i]) for i in range(3))
+
+    @staticmethod
+    def _color_ok(c):   # 유채색만 등급 색으로 인정 (회색 구분선 등을 잘못 읽은 값 제외)
+        return bool(c) and max(c) - min(c) >= 40
+
+    # 배치도에 칠해진 색 종류 (비슷한 색끼리 묶음): [[대표색, [구역...]], ...]
+    def _zone_color_groups(self, zones):
+        groups = []
+        for z in zones:
+            c = z.get('color')
+            if not c:
+                continue
+            for gr in groups:
+                if self._cdist(gr[0], c) <= 45:
+                    gr[1].append(z); break
+            else:
+                groups.append([c, [z]])
+        return groups
+
+    # 등급 색 중 배치도의 어떤 색과도 맞지 않는(또는 못 읽은) 등급 목록
+    def _unmatched_grades(self, zones, grade_list):
+        groups = self._zone_color_groups(zones)
+        bad = []
+        for g in grade_list or []:
+            c = g.get('color')
+            if not (self._color_ok(c) and
+                    any(self._cdist(gr[0], c) <= 60 for gr in groups)):
+                bad.append(g)
+        return bad
+
+    # 모든 등급의 색이 배치도 색과 맞도록 보완한다.
+    #  1) 안 맞는 등급이 있으면 '등급 별 가격' 패널을 화면 캡처해 색 점을 직접 읽음
+    #  2) 그래도 하나만 남으면, 배치도에서 주인이 없는 색 하나를 그 등급 색으로 확정
+    def _complete_grade_colors(self, zones, grade_list):
+        if not zones or not grade_list:
+            return
+        if self._unmatched_grades(zones, grade_list):
+            self._read_grade_colors_from_screen(grade_list)
+            self._close_price_panel()
+        bad = self._unmatched_grades(zones, grade_list)
+        if len(bad) == 1:
+            good = [g['color'] for g in grade_list if g is not bad[0]]
+            free = [gr for gr in self._zone_color_groups(zones)
+                    if not any(self._cdist(gr[0], c) <= 60 for c in good)]
+            if len(free) == 1:
+                bad[0]['color'] = free[0][0]
+
+    # 구역 색이 선택 등급의 색과 같은 구역만 남긴다.
     def _filter_zones_by_grade(self, zones, grade, grade_list):
         tgt = (grade or {}).get('color')
-        if not tgt:
+        if not self._color_ok(tgt):
             return None
-        palette = [g.get('color') for g in (grade_list or []) if g.get('color')]
+        palette = [g.get('color') for g in (grade_list or [])
+                   if self._color_ok(g.get('color'))]
         if tgt not in palette:
             palette.append(tgt)
-
-        def dist(a, b):
-            return sum(abs(a[i] - b[i]) for i in range(3))
-
         out = []
         for z in zones:
             c = z.get('color')
             if not c:
                 continue
-            near = min(palette, key=lambda p: dist(p, c))
-            if near == tgt and dist(c, tgt) <= 120:
+            near = min(palette, key=lambda p: self._cdist(p, c))
+            if near == tgt and self._cdist(c, tgt) <= 60:
                 out.append(z)
         return out
+
+    # 등급 색을 DOM에서 못 읽었을 때: '등급 별 가격' 패널을 열고 화면을 캡처해
+    # 각 등급 이름 왼쪽의 색 점을 픽셀로 읽는다. 읽은 색은 grade_list 에 채운다.
+    def _read_grade_colors_from_screen(self, grade_list):
+        drv = self.driver
+        js = r"""
+        var names=arguments[0], out=[];
+        for(var k=0;k<names.length;k++){
+            var best=null, bl=1e9;
+            var all=document.querySelectorAll('li,tr,div,p,span,dt,dd,td');
+            for(var i=0;i<all.length;i++){
+                var t=(all[i].textContent||'').replace(/\s+/g,' ').trim();
+                if(t.indexOf(names[k])!==0 || t.length>40) continue;
+                var r=all[i].getBoundingClientRect();
+                if(r.width<=0||r.height<=0) continue;
+                if(t.length<bl){ bl=t.length; best=r; }
+            }
+            out.push(best?[best.left,best.top,best.right,best.bottom]:null);
+        }
+        return {rects:out, w:window.innerWidth};
+        """
+        names = [g.get('name', '') for g in grade_list]
+
+        def rects():
+            try:
+                return drv.execute_script(js, names) or {}
+            except Exception:
+                return {}
+        r = rects()
+        if not any(r.get('rects') or []):
+            self._open_price_panel()
+            self._wait(0.6)
+            try: drv.switch_to.default_content()
+            except Exception: pass
+            r = rects()
+        if not any(r.get('rects') or []):
+            return False
+        try:
+            im = Image.open(io.BytesIO(drv.get_screenshot_as_png())).convert("RGB")
+        except Exception:
+            return False
+        k = im.width / float(r.get('w') or im.width)
+        arr = np.asarray(im).astype(np.int32)
+        found = False
+        for g, rc in zip(grade_list, r['rects']):
+            if not rc:
+                continue
+            x0 = int(max(0, (rc[0] - 48) * k)); x1 = int(min(im.width, (rc[0] + 30) * k))
+            y0 = int(max(0, (rc[1] - 8) * k));  y1 = int(min(im.height, (rc[3] + 24) * k))
+            box = arr[y0:y1, x0:x1].reshape(-1, 3)
+            if not len(box):
+                continue
+            satp = box[(box.max(axis=1) - box.min(axis=1)) >= 60]
+            if len(satp) >= 8:
+                g['color'] = [int(v) for v in np.median(satp, axis=0)]
+                found = True
+        return found
 
     # 구역 라벨을 실제 마우스로 클릭 (React 이벤트가 확실히 발생하도록)
     def _click_onestop_zone(self, label, zone=None):
@@ -1684,8 +1809,6 @@ class MacroThread(QThread):
             # 등급 별 가격 패널이 배치도를 가릴 수 있으니 닫고 읽는다
             self._close_price_panel()
             self._wait(0.3)
-            self._grade_palette = [g.get('color') for g in (grade_list or [])
-                                   if g.get('color')]
             all_zones = self._scan_onestop_zones()
             self._save_map_html()
         else:
@@ -1694,6 +1817,7 @@ class MacroThread(QThread):
 
         if onestop:
             if gname:
+                self._complete_grade_colors(all_zones, grade_list)
                 zs = self._filter_zones_by_grade(all_zones, grade, grade_list)
                 if zs:
                     zone_list = zs
