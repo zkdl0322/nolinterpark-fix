@@ -2236,11 +2236,14 @@ class MacroThread(QThread):
         by_name = {z.get('label', '').upper(): z for z in zone_list if z.get('named', True)}
         try:
             while True:
-                self.log("구역 번호 입력 (','로 여러 개)")
+                self.log("구역 번호 입력 (','로 여러 개) Enter 시 모든 구역")
                 ans = self._ask(timeout=120)
                 if ans is None:
                     self.log("시간 초과 → 목록의 모든 구역을 순회합니다")
                     return zone_list
+                if not ans.strip():
+                    self.log("→ 모든 구역")
+                    return zone_list                    # 그냥 Enter = 모든 구역 순회
                 self.log(f"→ {ans}")
                 selected = []
                 for part in ans.split(","):
