@@ -1930,11 +1930,20 @@ class MacroThread(QThread):
         return False
 
     # 화면 좌표에 있는 요소에 포인터/마우스 이벤트를 순서대로 직접 발생시킨다.
-    # (실제 마우스 클릭이 반영되지 않는 화면을 위한 두 번째 방법)
-    def _dispatch_click_at(self, x, y):
+    # small_only=True 면 그 자리에 겹친 요소 중 '좌석 크기(작은)' 요소에만 보낸다.
+    def _dispatch_click_at(self, x, y, small_only=False):
         js = r"""
-        var x=arguments[0], y=arguments[1];
-        var e=document.elementFromPoint(x,y);
+        var x=arguments[0], y=arguments[1], smallOnly=arguments[2];
+        var e=null;
+        if(smallOnly){
+            var st=document.elementsFromPoint(x,y)||[];
+            for(var i=0;i<st.length;i++){
+                var r=st[i].getBoundingClientRect();
+                if(r.width>=4 && r.height>=4 && r.width<=70 && r.height<=70){ e=st[i]; break; }
+            }
+        } else {
+            e=document.elementFromPoint(x,y);
+        }
         if(!e) return false;
         var o={bubbles:true,cancelable:true,composed:true,view:window,clientX:x,clientY:y,
                screenX:x,screenY:y,button:0,buttons:1,pointerId:1,pointerType:'mouse',isPrimary:true};
@@ -1949,9 +1958,69 @@ class MacroThread(QThread):
         return true;
         """
         try:
-            return bool(self.driver.execute_script(js, x, y))
+            return bool(self.driver.execute_script(js, x, y, bool(small_only)))
         except Exception:
             return False
+
+    # 배치도가 다 그려져 화면이 멈출 때까지 대기 (로딩/확대 애니메이션 중에 읽지 않게)
+    def _wait_map_still(self, timeout=4.0):
+        prev = None
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            im, _ = self._map_capture()
+            if im is not None:
+                cur = np.asarray(im.resize((160, 120))).astype(np.int32)
+                if prev is not None and prev.shape == cur.shape \
+                        and np.abs(cur - prev).mean() < 0.6:
+                    return True
+                prev = cur
+            self._wait(0.3)
+        return False
+
+    # 좌석 위치에 겹쳐 있는 요소들과 배치도 구조 요약 (진단/판단용)
+    def _seat_stack(self, x, y):
+        js = r"""
+        var x=arguments[0], y=arguments[1];
+        function d(e){
+            var c=(e.getAttribute&&e.getAttribute('class'))||'';
+            var r=e.getBoundingClientRect();
+            return e.tagName.toLowerCase()+(c?'.'+c.split(/\s+/)[0].slice(0,34):'')
+                   +'['+Math.round(r.width)+'x'+Math.round(r.height)+']';
+        }
+        var st=document.elementsFromPoint(x,y)||[];
+        var stack=[]; for(var i=0;i<st.length && i<7;i++) stack.push(d(st[i]));
+        // 배치도 뿌리: 클래스에 SeatMap 이 들어간 가장 바깥 조상
+        var root=null, n=st[0];
+        while(n){ var c=(n.getAttribute&&n.getAttribute('class'))||'';
+                  if(/seatmap/i.test(c)) root=n; n=n.parentElement; }
+        var summary=[], html='';
+        if(root){
+            var cnt={}, all=root.querySelectorAll('*');
+            for(var i=0;i<all.length;i++){
+                var c=(all[i].getAttribute('class')||'').split(/\s+/)[0];
+                var k=all[i].tagName.toLowerCase()+(c?'.'+c.slice(0,34):'');
+                cnt[k]=(cnt[k]||0)+1;
+            }
+            var keys=Object.keys(cnt).sort(function(a,b){return cnt[b]-cnt[a];}).slice(0,18);
+            summary.push('구조: '+keys.map(function(k){return k+'×'+cnt[k];}).join(', '));
+            html=(root.outerHTML||'').slice(0,400000);
+        }
+        return {top: st.length?d(st[0]):'', stack:stack, summary:summary, html:html};
+        """
+        try:
+            return self.driver.execute_script(js, x, y) or {}
+        except Exception:
+            return {}
+
+    def _save_text(self, name, text):
+        if not text:
+            return
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), name)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            pass
 
     # 좌석 화면에서 선택 등급 색의 예매 가능 좌석을 찾아 클릭한다.
     def _click_onestop_seat(self, grade=None):
@@ -2012,21 +2081,31 @@ class MacroThread(QThread):
             if covered:
                 continue
             tried += 1
-            # 진단용: 그 자리에 실제로 어떤 요소가 있는지 (처음 몇 번만 기록)
-            if getattr(self, '_seat_diag', 0) < 3:
+            # 구역 그림(blockImg) 층이 아직 좌석을 덮고 있으면 사라질 때까지 잠깐 대기
+            info = self._seat_stack(x, y)
+            for _ in range(8):
+                if 'blockimg' not in (info.get('top') or '').lower():
+                    break
+                self._wait(0.25)
+                info = self._seat_stack(x, y)
+            # 진단용: 그 자리에 겹쳐 있는 요소들 (처음 두 번만 기록)
+            if getattr(self, '_seat_diag', 0) < 2:
                 self._seat_diag = getattr(self, '_seat_diag', 0) + 1
-                try:
-                    what = drv.execute_script(
-                        "var e=document.elementFromPoint(arguments[0],arguments[1]);"
-                        "if(!e)return 'none';var c=e.getAttribute('class')||'';"
-                        "return e.tagName+(c?'.'+c.slice(0,40):'');", x, y)
-                except Exception:
-                    what = '?'
-                self.log(f"[진단] 좌석 클릭 위치 ({int(x)},{int(y)}) 대상={what}")
-            # 1) 실제 마우스 클릭  2) 안 되면 같은 자리에 클릭 이벤트를 직접 발생
-            for how in ("mouse", "event"):
+                self.log(f"[진단] 좌석 위치 ({int(x)},{int(y)}) 겹친 요소: "
+                         + " > ".join(info.get('stack') or ['none']))
+                if self._seat_diag == 1:
+                    for line in info.get('summary') or []:
+                        self.log("[진단] " + line)
+                    self._save_text("onestop_map.txt", info.get('html') or '')
+            # 1) 실제 마우스 클릭
+            # 2) 그 자리 아래에 깔린 좌석 크기의 요소에 클릭 이벤트 직접 발생
+            # 3) 맨 위 요소에 클릭 이벤트 직접 발생
+            for how in ("mouse", "seat-el", "event"):
                 if how == "mouse":
                     self._click_viewport_point(x, y)
+                elif how == "seat-el":
+                    if not self._dispatch_click_at(x, y, small_only=True):
+                        continue
                 else:
                     self._dispatch_click_at(x, y)
                 # 선택 반영(서버 응답)을 잠깐 기다린다 — 성급히 또 누르지 않게
@@ -2034,7 +2113,7 @@ class MacroThread(QThread):
                     self._wait(0.2)
                     self._accept_alert()
                     if self._seat_selected() is True:
-                        self.log("→ 좌석 선택 성공")
+                        self.log(f"→ 좌석 선택 성공 ({how})")
                         return True
         if tried:
             self.log("좌석을 눌렀지만 선택되지 않았습니다 (다음 구역으로)")
@@ -2098,6 +2177,7 @@ class MacroThread(QThread):
             # 등급 별 가격 패널이 배치도를 가릴 수 있으니 닫고 읽는다
             self._close_price_panel()
             self._wait(0.3)
+            self._wait_map_still()
             all_zones = self._scan_onestop_zones()
             self._save_map_html()
         else:
