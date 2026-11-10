@@ -24,11 +24,10 @@ from PySide6.QtCore import Qt, QThread, Signal, QObject
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QSpinBox, QPushButton,
-    QButtonGroup, QTextEdit, QMessageBox
+    QLineEdit, QPushButton, QTextEdit, QMessageBox
 )
 
-EXPIRE_DATE = "~26.09.30"
+SEARCH_DELAY = 1          # 구역을 누른 뒤 좌석 화면이 뜨기를 기다리는 시간(초)
 LOGIN_URL   = (
     "https://accounts.yanolja.com/v3/login"
     "?clientId=inpark-pc&postProc=FULLSCREEN"
@@ -37,7 +36,6 @@ LOGIN_URL   = (
     "&nol_device_id=178123879502153851"
     "&redirect=aHR0cHM6Ly9hY2NvdW50cy5pbnRlcnBhcmsuY29tL2xvZ2luL3N1Y2Nlc3Mvbm9sP3Bvc3RQcm9jPUZVTExTQ1JFRU4mb3JpZ2luPWh0dHBzJTNBJTJGJTJGbm9sLmludGVycGFyay5jb20lMkY"
 )
-GRADES = ["스탠딩R", "스탠딩S", "지정석R", "지정석S", "지정석A", "지정석B"]  # fallback only
 
 # 공연마다 등급/색상/구역이 다르므로 모두 페이지에서 동적으로 읽어온다.
 
@@ -421,7 +419,49 @@ def find_available_seats(im, target=None, hue_tol=28.0):
             if min(d, 360.0 - d) <= hue_tol:
                 keep.append(c)
         comps = keep
-    return [{'fx': c['cx'] / W, 'fy': c['cy'] / H, 'color': c['color']} for c in comps]
+    return [{'fx': c['cx'] / W, 'fy': c['cy'] / H, 'color': c['color'],
+             'px': c['cx'], 'py': c['cy'], 'side': c['side']} for c in comps]
+
+
+# 붙어 있는 좌석 n개 묶음 찾기 (가로·세로, 그리고 비스듬히 놓인 구역의 대각선 줄).
+# 좌석 간격은 좌석 지름의 약 1.4배이므로, 중심 거리가 지름의 1.75배 이내면
+# 바로 옆자리로 본다. n>=3 이면 한 줄로 곧게 이어진 것만 고른다.
+# 반환: [[seat, seat, ...], ...]  (n=1 이면 좌석 하나씩)
+def adjacent_seat_groups(seats, n):
+    if n <= 1:
+        return [[s] for s in seats]
+    import math
+    nb = {i: [] for i in range(len(seats))}
+    for i, a in enumerate(seats):
+        for j, b in enumerate(seats):
+            if i == j:
+                continue
+            d = math.hypot(a['px'] - b['px'], a['py'] - b['py'])
+            if d <= 1.75 * (a['side'] + b['side']) / 2.0:
+                nb[i].append(j)
+    groups, seen = [], set()
+
+    def extend(path):
+        if len(path) == n:
+            key = tuple(sorted(path))
+            if key not in seen:
+                seen.add(key)
+                groups.append([seats[k] for k in path])
+            return
+        a, b = seats[path[-2]], seats[path[-1]]
+        ang = math.atan2(b['py'] - a['py'], b['px'] - a['px'])
+        for c in nb[path[-1]]:
+            if c in path:
+                continue
+            ang2 = math.atan2(seats[c]['py'] - b['py'], seats[c]['px'] - b['px'])
+            diff = abs((ang2 - ang + math.pi) % (2 * math.pi) - math.pi)
+            if diff <= math.radians(25):                 # 같은 방향으로 곧게
+                extend(path + [c])
+
+    for i in nb:
+        for j in nb[i]:
+            extend([i, j])
+    return groups
 
 
 # ───────────────────────────────────────────────
@@ -442,6 +482,7 @@ class MacroThread(QThread):
         super().__init__()
         self.driver  = driver
         self.delay   = delay
+        self.need    = 1           # 필요 매수
         self.sig     = signals
         self._stop   = False
         self._pause  = False
@@ -1493,16 +1534,20 @@ class MacroThread(QThread):
         if(b.width*b.height>area){ area=b.width*b.height; best=c[i]; }
     }
     if(!best || area<40000) return null;
-    // 실제로 화면에 보이는 부분만 (뷰포트와, 넘침을 잘라내는 상위 요소로 자른 영역)
-    var r=best.getBoundingClientRect();
+    // 캡처 영역 = 배치도 컨테이너(클래스에 SeatMap 이 들어간 가장 바깥 조상)가
+    // 화면에 보이는 부분. 컨테이너를 못 찾으면 배치도 요소 자체의 보이는 부분.
+    var box=best, n=best.parentElement;
+    while(n && n!==document.body){
+        var c=(n.getAttribute&&n.getAttribute('class'))||'';
+        if(/seatmap/i.test(c)){
+            var q=n.getBoundingClientRect();
+            if(q.width>=200 && q.height>=200) box=n;
+        }
+        n=n.parentElement;
+    }
+    var r=box.getBoundingClientRect();
     var L=Math.max(r.left,0), T=Math.max(r.top,0);
     var R=Math.min(r.right,window.innerWidth), B=Math.min(r.bottom,window.innerHeight);
-    for(var p=best.parentElement; p && p!==document.documentElement; p=p.parentElement){
-        var cs=getComputedStyle(p);
-        if((cs.overflowX+cs.overflowY).replace(/visible/g,'')==='') continue;
-        var q=p.getBoundingClientRect();
-        L=Math.max(L,q.left); T=Math.max(T,q.top); R=Math.min(R,q.right); B=Math.min(B,q.bottom);
-    }
     if(R-L<50 || B-T<50) return null;
     return {el:best, left:L, top:T, width:R-L, height:B-T, vw:window.innerWidth,
             html:(arguments[0] ? (best.outerHTML||'').slice(0,300000) : '')};
@@ -2027,6 +2072,10 @@ class MacroThread(QThread):
         if self._seat_selected() is True:
             self.log("→ 좌석 이미 선택됨")
             return True
+        if getattr(self, '_sel_count', 0) > 0:
+            # 필요 매수보다 적게 남아 있는 선택은 비우고 다시 찾는다
+            self._click_text_button(["전체삭제"])
+            self._wait(0.4)
         target = (grade or {}).get('color')
         if not self._color_ok(target):
             target = None
@@ -2059,65 +2108,108 @@ class MacroThread(QThread):
                 self.log(f"※ 선택 등급 색이 아닌 좌석만 {n_all}개 보여 건너뜁니다.")
             return False
 
+        need = max(1, getattr(self, 'need', 1))
+        groups = adjacent_seat_groups(seats, need)
+        if not groups:
+            if need > 1 and not getattr(self, '_adj_warned', False):
+                self._adj_warned = True
+                self.log(f"※ 붙어 있는 {need}연석이 없는 구역은 건너뜁니다.")
+            return False
         import random
-        random.shuffle(seats)
-        self.log(f"예매 가능 좌석 {len(seats)}개 발견 → 클릭 시도")
+        random.shuffle(groups)
+        self.log(f"예매 가능 좌석 {len(seats)}개"
+                 + (f" (붙어 있는 {need}연석 {len(groups)}곳)" if need > 1 else "")
+                 + " 발견 → 클릭 시도")
         drv = self.driver
-        tried = 0
-        for st in seats:
-            if tried >= 3:
-                break
-            x = m['left'] + m['width'] * st['fx']
-            y = m['top'] + m['height'] * st['fy']
-            # 그 자리를 버튼(+, -, 등급 별 가격 등)이 덮고 있을 때만 건너뜀.
-            # (좌석은 배치도 그림과 다른 층에 그려질 수 있으므로 그 외에는 그대로 누른다)
+        for group in groups[:3]:
+            pts = [(m['left'] + m['width'] * st['fx'], m['top'] + m['height'] * st['fy'])
+                   for st in group]
+            # 버튼(+, -, 등급 별 가격 등)에 덮인 좌석이 끼어 있으면 그 묶음은 건너뜀
             try:
-                covered = drv.execute_script(
+                covered = any(drv.execute_script(
                     "var e=document.elementFromPoint(arguments[0],arguments[1]);"
                     "return !!(e && e.closest && e.closest('button,a,[role=\"button\"],input'));",
-                    x, y)
+                    x, y) for x, y in pts)
             except Exception:
                 covered = False
             if covered:
                 continue
-            tried += 1
-            # 구역 그림(blockImg) 층이 아직 좌석을 덮고 있으면 사라질 때까지 잠깐 대기
-            info = self._seat_stack(x, y)
-            for _ in range(8):
-                if 'blockimg' not in (info.get('top') or '').lower():
+            ok = True
+            for x, y in pts:
+                before = self._selected_count()
+                if not self._click_one_seat(x, y, before):
+                    ok = False
                     break
-                self._wait(0.25)
-                info = self._seat_stack(x, y)
-            # 진단용: 그 자리에 겹쳐 있는 요소들 (처음 두 번만 기록)
-            if getattr(self, '_seat_diag', 0) < 2:
-                self._seat_diag = getattr(self, '_seat_diag', 0) + 1
-                self.log(f"[진단] 좌석 위치 ({int(x)},{int(y)}) 겹친 요소: "
-                         + " > ".join(info.get('stack') or ['none']))
-                if self._seat_diag == 1:
-                    for line in info.get('summary') or []:
-                        self.log("[진단] " + line)
-                    self._save_text("onestop_map.txt", info.get('html') or '')
-            # 1) 실제 마우스 클릭
-            # 2) 그 자리 아래에 깔린 좌석 크기의 요소에 클릭 이벤트 직접 발생
-            # 3) 맨 위 요소에 클릭 이벤트 직접 발생
-            for how in ("mouse", "seat-el", "event"):
-                if how == "mouse":
-                    self._click_viewport_point(x, y)
-                elif how == "seat-el":
-                    if not self._dispatch_click_at(x, y, small_only=True):
-                        continue
-                else:
-                    self._dispatch_click_at(x, y)
-                # 선택 반영(서버 응답)을 잠깐 기다린다 — 성급히 또 누르지 않게
-                for _ in range(8):
-                    self._wait(0.2)
-                    self._accept_alert()
-                    if self._seat_selected() is True:
-                        self.log(f"→ 좌석 선택 성공 ({how})")
-                        return True
-        if tried:
-            self.log("좌석을 눌렀지만 선택되지 않았습니다 (다음 구역으로)")
+            if ok and self._seat_selected() is True:
+                self.log("→ 좌석 선택 성공")
+                return True
+            # 일부만 잡혔으면 비우고 다음 묶음으로
+            if self._selected_count() > 0:
+                self._click_text_button(["전체삭제"])
+                self._wait(0.5)
+            self.log("좌석을 눌렀지만 선택되지 않았습니다")
         return False
+
+    # 현재 선택된 좌석 수 (모르면 0)
+    def _selected_count(self):
+        self._sel_count = 0
+        self._seat_selected()
+        return getattr(self, '_sel_count', 0)
+
+    # 좌석 하나를 눌러 '선택 좌석' 수가 before 보다 늘어나는지 확인한다.
+    def _click_one_seat(self, x, y, before):
+        # 구역 그림(blockImg) 층이 아직 좌석을 덮고 있으면 사라질 때까지 잠깐 대기
+        info = self._seat_stack(x, y)
+        for _ in range(8):
+            if 'blockimg' not in (info.get('top') or '').lower():
+                break
+            self._wait(0.25)
+            info = self._seat_stack(x, y)
+        # 진단용: 그 자리에 겹쳐 있는 요소들 (처음 두 번만 기록)
+        if getattr(self, '_seat_diag', 0) < 2:
+            self._seat_diag = getattr(self, '_seat_diag', 0) + 1
+            self.log(f"[진단] 좌석 위치 ({int(x)},{int(y)}) 겹친 요소: "
+                     + " > ".join(info.get('stack') or ['none']))
+            if self._seat_diag == 1:
+                for line in info.get('summary') or []:
+                    self.log("[진단] " + line)
+                self._save_text("onestop_map.txt", info.get('html') or '')
+        # 1) 실제 마우스: 좌석 위로 움직여 올린 뒤 클릭
+        # 2) 그 자리 아래에 깔린 좌석 크기의 요소에 클릭 이벤트 직접 발생
+        # 3) 맨 위 요소에 클릭 이벤트 직접 발생
+        for how in ("mouse", "seat-el", "event"):
+            if how == "mouse":
+                self._hover_click(x, y)
+            elif how == "seat-el":
+                if not self._dispatch_click_at(x, y, small_only=True):
+                    continue
+            else:
+                self._dispatch_click_at(x, y)
+            # 선택 반영(서버 응답)을 잠깐 기다린다 — 성급히 또 누르지 않게
+            for _ in range(8):
+                self._wait(0.2)
+                self._accept_alert()
+                if self._selected_count() > before:
+                    return True
+        return False
+
+    # 사람처럼 좌석 옆에서 좌석 위로 마우스를 옮긴 뒤 잠깐 멈췄다가 클릭
+    def _hover_click(self, x, y):
+        x, y = int(round(x)), int(round(y))
+        try:
+            ac = ActionChains(self.driver, duration=60)
+            pa = ac.w3c_actions.pointer_action
+            pa.move_to_location(max(0, x - 6), max(0, y - 4))
+            pa.pause(0.05)
+            pa.move_to_location(x, y)
+            pa.pause(0.12)
+            pa.pointer_down()
+            pa.pause(0.05)
+            pa.pointer_up()
+            ac.perform()
+            return True
+        except Exception:
+            return self._click_viewport_point(x, y)
 
     # ── 신형 onestop: 구역 목록 표시 + 선택 ────
     # 형식:  1. 모두 / 2. A / 3. B ... / 11. 207 ...
@@ -2131,9 +2223,8 @@ class MacroThread(QThread):
             return (0, 0, lbl)                          # 알파벳 구역 먼저
         zone_list = sorted(zone_list, key=key)          # (안정 정렬: 같은 순위는 화면 순서)
         self.log("좌석 구역을 선택해주세요")
-        self.log("1. 모두")
         unnamed = []
-        for i, z in enumerate(zone_list, 2):
+        for i, z in enumerate(zone_list, 1):
             if z.get('named', True):
                 self.log(f"{i}. {z.get('label', '')}")
             else:
@@ -2142,32 +2233,46 @@ class MacroThread(QThread):
                 self.log(f"{i}. (이름을 못 읽은 구역 - 배치도의 번호표 {i})")
         if unnamed and self._show_zone_badges(unnamed):
             self.log("※ 이름을 못 읽은 구역은 배치도 위에 노란 번호표로 표시했습니다.")
-        self.log("번호 입력(','로 여러개). 1 또는 그냥 Enter = 모두")
-        ans = self._ask(timeout=120)
-        self._hide_zone_badges()
-        if not ans:
-            return zone_list
-        self.log(f"→ {ans}")
         by_name = {z.get('label', '').upper(): z for z in zone_list if z.get('named', True)}
-        selected = []
-        for part in ans.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            z = None
-            if part.isdigit():
-                n = int(part)
-                if n == 1:
-                    return zone_list                    # 모두
-                if 2 <= n <= len(zone_list) + 1:
-                    z = zone_list[n - 2]
-            if z is None:
-                z = by_name.get(part.upper())           # 구역 이름을 직접 입력한 경우
-            if z is None:
-                self.log(f"'{part}' 은(는) 목록에 없어 건너뜁니다.")
-            elif z not in selected:
-                selected.append(z)
-        return selected if selected else zone_list
+        try:
+            while True:
+                self.log("구역 번호 입력 (','로 여러 개)")
+                ans = self._ask(timeout=120)
+                if ans is None:
+                    self.log("시간 초과 → 목록의 모든 구역을 순회합니다")
+                    return zone_list
+                self.log(f"→ {ans}")
+                selected = []
+                for part in ans.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    z = None
+                    if part.isdigit() and 1 <= int(part) <= len(zone_list):
+                        z = zone_list[int(part) - 1]
+                    if z is None:
+                        z = by_name.get(part.upper())       # 구역 이름을 직접 입력한 경우
+                    if z is None:
+                        self.log(f"'{part}' 은(는) 목록에 없습니다.")
+                    elif z not in selected:
+                        selected.append(z)
+                if selected:
+                    return selected
+        finally:
+            self._hide_zone_badges()
+
+    # ── 필요 매수 입력 ───────────────────────
+    def _ask_count(self):
+        while True:
+            self.log("필요 매수를 입력하세요 (1~4)")
+            ans = self._ask(timeout=120)
+            if ans is None:
+                self.log("시간 초과 → 1매로 진행")
+                return 1
+            self.log(f"→ {ans}")
+            if ans.strip().isdigit() and 1 <= int(ans) <= 4:
+                return int(ans)
+            self.log("1~4 사이의 숫자를 입력해 주세요.")
 
     # ── 구역 선택 (등급 클릭 후 펼쳐진 구역만 표시; 색 미사용) ──
     def _ask_zones(self, grade=None, grade_list=None):
@@ -2519,7 +2624,8 @@ class MacroThread(QThread):
                 return None
             if n is None or n == -1:
                 return None
-            return n > 0
+            self._sel_count = int(n)
+            return n >= max(1, getattr(self, 'need', 1))    # 필요 매수만큼 선택됐는지
         def fn():
             try:
                 t = self.driver.execute_script(
@@ -2776,7 +2882,7 @@ class MacroThread(QThread):
         cycle = 0
         consecutive_err = 0
         self._diag_done = False
-        self.log(f"빈 좌석 탐색을 시작합니다 (딜레이 {self.delay}초)")
+        self.log("빈 좌석 탐색을 시작합니다")
         while True:
             for zone in zones:
                 self._wait(0)
@@ -2994,8 +3100,8 @@ class MacroThread(QThread):
     def _is_payment_page(self):
         if self._is_onestop():
             # 좌석 단계(/onestop/seat)를 벗어나 다음 단계 주소로 넘어갔는지
-            u = self._url().split('?')[0].rstrip('/')
-            if not u.endswith('/seat'):
+            u = self._url()
+            if 'step=' in u or not u.split('?')[0].rstrip('/').endswith('/seat'):
                 return True
         def fn():
             try:
@@ -3017,6 +3123,110 @@ class MacroThread(QThread):
         next_kw = ["할인선택", "가격선택", "주문자확인", "배송선택", "배송지",
                    "결제수단", "최종결제", "결제하기", "예매자정보", "무통장"]
         return any(k in joined for k in next_kw)
+
+    # ── 가격 선택: '일반' 매수를 필요 매수에 맞추기 ──
+    _JS_PRICE_ROW = r"""
+    // '일반' 가격 행의 [현재 매수, + 버튼] 을 찾는다.
+    var name=arguments[0];
+    var els=document.querySelectorAll('span,div,p,strong,b,dt,label,li');
+    for(var i=0;i<els.length;i++){
+        var e=els[i];
+        if(e.children.length>0) continue;
+        if((e.textContent||'').replace(/\s+/g,'')!==name) continue;
+        var r0=e.getBoundingClientRect();
+        if(r0.width<=0||r0.height<=0) continue;
+        var row=e.parentElement;
+        for(var d=0; d<6 && row; d++, row=row.parentElement){
+            var btns=[].slice.call(row.querySelectorAll('button,[role="button"]')).filter(
+                function(b){var r=b.getBoundingClientRect();return r.width>0&&r.height>0;});
+            if(btns.length<2) continue;
+            if(btns.length>2) break;                 // 여러 가격 행을 한꺼번에 잡은 것
+            btns.sort(function(a,b){return a.getBoundingClientRect().left-b.getBoundingClientRect().left;});
+            var cur=null, leaves=row.querySelectorAll('*');
+            for(var k=0;k<leaves.length;k++){
+                if(leaves[k].children.length>0) continue;
+                var t=(leaves[k].textContent||'').trim();
+                if(/^\d{1,2}$/.test(t)){ cur=+t; break; }
+            }
+            return {cur:cur, plus:btns[1], minus:btns[0], disabled:!!btns[1].disabled};
+        }
+    }
+    return null;
+    """
+
+    def _set_price_count(self, need):
+        drv = self.driver
+        last = None
+        for _ in range(need * 3 + 4):
+            try:
+                row = drv.execute_script(self._JS_PRICE_ROW, "일반")
+            except Exception:
+                row = None
+            if not row:
+                self.log("가격 선택 화면에서 '일반' 항목을 찾지 못했습니다 (직접 맞춰 주세요)")
+                return False
+            cur = row.get('cur')
+            if cur is None:
+                self.log("'일반' 매수를 읽지 못했습니다 (직접 맞춰 주세요)")
+                return False
+            if cur == need:
+                self.log(f"→ 일반 {need}매로 맞춤")
+                return True
+            btn = row['plus'] if cur < need else row['minus']
+            try:
+                btn.click()
+            except Exception:
+                try: drv.execute_script("arguments[0].click();", btn)
+                except Exception: pass
+            self._wait(0.35)
+            last = cur
+        self.log("일반 매수를 맞추지 못했습니다 (직접 맞춰 주세요)")
+        return False
+
+    # [N매 예매하기] 버튼이 보이면 클릭
+    def _click_book_button(self):
+        drv = self.driver
+        try:
+            for el in drv.find_elements(By.XPATH, "//button[contains(normalize-space(.),'예매하기')]"):
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        label = (el.text or '').strip()
+                        try:
+                            el.click()
+                        except Exception:
+                            drv.execute_script("arguments[0].click();", el)
+                        self.log(f"→ [{label or '예매하기'}] 클릭")
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    # 좌석 선택 완료 후: 가격 선택(일반 N매) → 예매하기
+    def _onestop_price_and_book(self):
+        need = max(1, getattr(self, 'need', 1))
+        self.log("가격 선택 화면 대기 중...")
+        ready = False
+        for _ in range(40):
+            self._wait(0.5)
+            try:
+                if self.driver.execute_script(self._JS_PRICE_ROW, "일반"):
+                    ready = True
+                    break
+            except Exception:
+                pass
+        if not ready:
+            self.log("가격 선택 화면이 나타나지 않았습니다")
+            return False
+        self._set_price_count(need)
+        self._wait(0.3)
+        for _ in range(10):
+            if self._click_book_button():
+                return True
+            self._wait(0.5)
+        self.log("[예매하기] 버튼을 찾지 못했습니다")
+        return False
 
     # ── 결제 대기 ─────────────────────────────
     def _wait_payment(self):
@@ -3109,18 +3319,26 @@ class MacroThread(QThread):
                      f"({len(zones)}개)")
             self._wait(0.3)
 
-            # ⑥ 구역 순회 + 좌석 클릭
+            # ⑤-② 필요 매수 입력
+            self.need = self._ask_count()
+            self.log(f"필요 매수: {self.need}매")
+
+            # ⑥ 구역 순회 + 좌석 클릭 (회색이면 계속 순회, 색이 있으면 자동 클릭)
             self._rotate_zones(zones, grade)
 
             # ⑦ 좌석선택완료
             self._click_complete()
 
-            # ⑦-② 결제 페이지 진입 대기 (가격/할인선택 단계)
-            self.log("결제 페이지 진입 대기 중...")
-            for _ in range(60):
-                self._wait(1)
-                if self._is_payment_page():
-                    break
+            if self._is_onestop():
+                # ⑦-② 가격 선택에서 일반 N매로 맞추고 [예매하기] 클릭
+                self._onestop_price_and_book()
+            else:
+                # ⑦-② 결제 페이지 진입 대기 (가격/할인선택 단계)
+                self.log("결제 페이지 진입 대기 중...")
+                for _ in range(60):
+                    self._wait(1)
+                    if self._is_payment_page():
+                        break
 
             # ⑧ 결제 대기 + 소리 알림
             self._wait_payment()
@@ -3260,51 +3478,6 @@ class LoginWindow(QWidget):
         root.setSpacing(8)
         root.setContentsMargins(16, 16, 16, 16)
 
-        root.addWidget(QLabel("로그인"))
-
-        # 인터파크 / 카카오 / 네이버 탭
-        tab_row = QHBoxLayout(); tab_row.setSpacing(0)
-        self._tab_btns = [
-            QPushButton("인터파크"),
-            QPushButton("카카오"),
-            QPushButton("네이버"),
-        ]
-        self._tab_grp = QButtonGroup(self)
-        for i, b in enumerate(self._tab_btns):
-            b.setCheckable(True); b.setFixedHeight(30)
-            self._tab_grp.addButton(b, i); tab_row.addWidget(b)
-        self._tab_btns[0].setChecked(True)
-        self._tab_grp.buttonClicked.connect(lambda _: self._update_tabs())
-        self._update_tabs()
-        root.addLayout(tab_row)
-
-        # ID
-        r = QHBoxLayout()
-        lb = QLabel("ID"); lb.setFixedWidth(40)
-        self.edit_id = QLineEdit(); self.edit_id.setFixedHeight(28)
-        r.addWidget(lb); r.addWidget(self.edit_id); root.addLayout(r)
-
-        # PW
-        r = QHBoxLayout()
-        lb = QLabel("PW"); lb.setFixedWidth(40)
-        self.edit_pw = QLineEdit()
-        self.edit_pw.setEchoMode(QLineEdit.EchoMode.Password)
-        self.edit_pw.setFixedHeight(28)
-        r.addWidget(lb); r.addWidget(self.edit_pw); root.addLayout(r)
-
-        # 딜레이
-        r = QHBoxLayout()
-        lb = QLabel("딜레이"); lb.setFixedWidth(44)
-        self.spin = QSpinBox()
-        self.spin.setRange(1, 60); self.spin.setValue(1); self.spin.setFixedHeight(28)
-        r.addWidget(lb); r.addWidget(self.spin); r.addStretch(); root.addLayout(r)
-
-        # 유효기간
-        lbl = QLabel(f"유효기간: {EXPIRE_DATE}")
-        lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        lbl.setStyleSheet("color:#888; font-size:9px;")
-        root.addWidget(lbl)
-
         # 시작하기
         self.btn_start = QPushButton("시작하기")
         self.btn_start.setFixedHeight(36)
@@ -3317,16 +3490,8 @@ class LoginWindow(QWidget):
 
         self.setLayout(root)
 
-    def _update_tabs(self):
-        for b in self._tab_btns:
-            b.setStyleSheet(
-                "background:#4a90d9; color:white; font-weight:bold;"
-                " border:none; border-radius:3px;" if b.isChecked() else
-                "background:#e0e0e0; color:#333; border:none; border-radius:3px;"
-            )
-
     def _on_start(self):
-        delay = self.spin.value()
+        delay = SEARCH_DELAY
         try:
             opts = webdriver.ChromeOptions()
             opts.add_argument("--disable-blink-features=AutomationControlled")
