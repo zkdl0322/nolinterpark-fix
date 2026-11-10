@@ -1493,26 +1493,47 @@ class MacroThread(QThread):
         if(b.width*b.height>area){ area=b.width*b.height; best=c[i]; }
     }
     if(!best || area<40000) return null;
+    // 실제로 화면에 보이는 부분만 (뷰포트와, 넘침을 잘라내는 상위 요소로 자른 영역)
     var r=best.getBoundingClientRect();
-    return {el:best, left:r.left, top:r.top, width:r.width, height:r.height,
-            html:(best.outerHTML||'').slice(0,300000)};
+    var L=Math.max(r.left,0), T=Math.max(r.top,0);
+    var R=Math.min(r.right,window.innerWidth), B=Math.min(r.bottom,window.innerHeight);
+    for(var p=best.parentElement; p && p!==document.documentElement; p=p.parentElement){
+        var cs=getComputedStyle(p);
+        if((cs.overflowX+cs.overflowY).replace(/visible/g,'')==='') continue;
+        var q=p.getBoundingClientRect();
+        L=Math.max(L,q.left); T=Math.max(T,q.top); R=Math.min(R,q.right); B=Math.min(B,q.bottom);
+    }
+    if(R-L<50 || B-T<50) return null;
+    return {el:best, left:L, top:T, width:R-L, height:B-T, vw:window.innerWidth,
+            html:(arguments[0] ? (best.outerHTML||'').slice(0,300000) : '')};
     """
+
+    # 배치도의 '화면에 보이는 부분'을 캡처해 (이미지, 화면상 위치정보) 반환.
+    # 이미지 안의 상대 위치(fx,fy)는 m 의 left/top/width/height 로 화면 좌표가 된다.
+    def _map_capture(self, with_html=False):
+        drv = self.driver
+        try: drv.switch_to.default_content()
+        except Exception: pass
+        try:
+            m = drv.execute_script(self._JS_ONESTOP_MAP, bool(with_html))
+            if not m:
+                return None, None
+            full = Image.open(io.BytesIO(drv.get_screenshot_as_png())).convert("RGB")
+            k = full.width / float(m.get('vw') or full.width)      # 화면 배율
+            box = (int(round(m['left'] * k)), int(round(m['top'] * k)),
+                   int(round((m['left'] + m['width']) * k)),
+                   int(round((m['top'] + m['height']) * k)))
+            return full.crop(box), m
+        except Exception:
+            return None, None
 
     # 배치도를 화면에 보이는 그림 그대로 캡처해 색 덩어리(구역)로 나눈다.
     # svg 안의 <image>, <img> 파일, canvas 로 그려진 배치도 모두 대응.
     def _scan_onestop_image(self):
-        drv = self.driver
-        try:
-            m = drv.execute_script(self._JS_ONESTOP_MAP)
-        except Exception:
-            m = None
-        if not m or not m.get('el'):
+        im, m = self._map_capture(with_html=True)
+        if im is None:
             return []
         self._onestop_map_html = m.get('html') or ''
-        try:
-            im = Image.open(io.BytesIO(m['el'].screenshot_as_png)).convert("RGB")
-        except Exception:
-            return []
         # 너무 크면 줄여서 처리 (경계선이 사라지지 않을 정도로만)
         if im.width > 1100:
             k = 1100.0 / im.width
@@ -1822,7 +1843,7 @@ class MacroThread(QThread):
         html = getattr(self, '_onestop_map_html', '')
         if not html:
             try:
-                m = self.driver.execute_script(self._JS_ONESTOP_MAP) or {}
+                m = self.driver.execute_script(self._JS_ONESTOP_MAP, True) or {}
                 html = m.get('html') or ''
             except Exception:
                 html = ''
@@ -1847,19 +1868,8 @@ class MacroThread(QThread):
             pass
 
     # ── 신형 onestop: 배치도 캡처 / 전체보기 복귀 / 좌석 클릭 ──
-    # 배치도 요소를 캡처해 (이미지, 화면상 위치정보) 반환
     def _onestop_map_shot(self):
-        drv = self.driver
-        try: drv.switch_to.default_content()
-        except Exception: pass
-        try:
-            m = drv.execute_script(self._JS_ONESTOP_MAP)
-            if not m or not m.get('el'):
-                return None, None
-            im = Image.open(io.BytesIO(m['el'].screenshot_as_png)).convert("RGB")
-            return im, m
-        except Exception:
-            return None, None
+        return self._map_capture()
 
     # 지금 배치도가 '전체 구역 보기' 상태인지 (색칠된 큰 구역이 보이면 전체 보기)
     def _onestop_is_overview(self):
@@ -1927,27 +1937,61 @@ class MacroThread(QThread):
         target = (grade or {}).get('color')
         if not self._color_ok(target):
             target = None
-        if self.delay < 0.7:
-            self._wait(0.7 - self.delay)          # 확대 애니메이션이 끝나길 잠깐 대기
-        im, m = self._onestop_map_shot()
-        if im is None:
+
+        def scan():
+            im, m = self._map_capture()
+            if im is None:
+                return None, [], 0
+            try:
+                allseats = find_available_seats(im, None)
+                seats = find_available_seats(im, target) if target else allseats
+            except Exception:
+                return m, [], 0
+            return m, seats, len(allseats)
+
+        # 확대 애니메이션이 끝나 화면이 멈출 때까지(두 번 연속 같은 결과) 기다린다
+        m, seats, n_all = scan()
+        for _ in range(6):
+            self._wait(0.25)
+            m2, seats2, n_all2 = scan()
+            same = (len(seats2) == len(seats) and n_all2 == n_all and all(
+                abs(a['fx'] - b['fx']) < 0.004 and abs(a['fy'] - b['fy']) < 0.004
+                for a, b in zip(seats, seats2)))
+            m, seats, n_all = m2, seats2, n_all2
+            if same:
+                break
+        if not seats or m is None:
+            if n_all and not getattr(self, '_othercolor_warned', False):
+                self._othercolor_warned = True
+                self.log(f"※ 선택 등급 색이 아닌 좌석만 {n_all}개 보여 건너뜁니다.")
             return False
-        try:
-            seats = find_available_seats(im, target)
-        except Exception:
-            seats = []
-        if not seats:
-            return False
+
         import random
         random.shuffle(seats)
+        self.log(f"예매 가능 좌석 {len(seats)}개 발견 → 클릭 시도")
+        drv = self.driver
         for st in seats[:3]:
-            self._click_viewport_point(m['left'] + m['width'] * st['fx'],
-                                       m['top'] + m['height'] * st['fy'])
-            self._wait(0.4)
-            self._accept_alert()
-            if self._seat_selected() is True:
-                self.log("→ 좌석 선택 성공")
-                return True
+            x = m['left'] + m['width'] * st['fx']
+            y = m['top'] + m['height'] * st['fy']
+            # 그 자리에 다른 요소(버튼, 패널 등)가 덮여 있으면 건너뜀
+            try:
+                on_map = drv.execute_script(
+                    "var e=document.elementFromPoint(arguments[1],arguments[2]);"
+                    "var m=arguments[0];return !!e && (e===m || m.contains(e) || e.contains(m));",
+                    m['el'], x, y)
+            except Exception:
+                on_map = True
+            if not on_map:
+                continue
+            self._click_viewport_point(x, y)
+            # 선택 반영(서버 응답)을 잠깐 기다린다 — 성급히 다른 좌석을 또 누르지 않게
+            for _ in range(8):
+                self._wait(0.2)
+                self._accept_alert()
+                if self._seat_selected() is True:
+                    self.log("→ 좌석 선택 성공")
+                    return True
+        self.log("좌석을 눌렀지만 선택되지 않았습니다 (다음 구역으로)")
         return False
 
     # ── 신형 onestop: 구역 목록 표시 + 선택 ────
