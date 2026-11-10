@@ -12,6 +12,11 @@ import winsound
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
+# exe(PyInstaller)로 묶을 때 빠지지 않도록, selenium 이 실행 중에 불러오는 모듈을 명시
+import selenium.webdriver.chrome.options      # noqa: F401
+import selenium.webdriver.chrome.webdriver    # noqa: F401
+import selenium.webdriver.chromium.webdriver  # noqa: F401
+import selenium.webdriver.remote.webdriver    # noqa: F401
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
