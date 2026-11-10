@@ -2165,15 +2165,6 @@ class MacroThread(QThread):
                 break
             self._wait(0.25)
             info = self._seat_stack(x, y)
-        # 진단용: 그 자리에 겹쳐 있는 요소들 (처음 두 번만 기록)
-        if getattr(self, '_seat_diag', 0) < 2:
-            self._seat_diag = getattr(self, '_seat_diag', 0) + 1
-            self.log(f"[진단] 좌석 위치 ({int(x)},{int(y)}) 겹친 요소: "
-                     + " > ".join(info.get('stack') or ['none']))
-            if self._seat_diag == 1:
-                for line in info.get('summary') or []:
-                    self.log("[진단] " + line)
-                self._save_text("onestop_map.txt", info.get('html') or '')
         # 1) 실제 마우스: 좌석 위로 움직여 올린 뒤 클릭
         # 2) 그 자리 아래에 깔린 좌석 크기의 요소에 클릭 이벤트 직접 발생
         # 3) 맨 위 요소에 클릭 이벤트 직접 발생
@@ -2303,9 +2294,6 @@ class MacroThread(QThread):
                     self.log(f"'{gname}' 등급 색을 못 읽음 → 전체 구역 표시")
                 else:
                     self.log(f"'{gname}' 색과 같은 구역을 못 찾음 → 전체 구역 표시")
-            sample = getattr(self, '_onestop_sample', '')
-            if sample and any(z.get('hint') and not z.get('named') for z in all_zones):
-                self.log("[진단] 구역 도형 예시: " + sample[:300])
         elif gname:
             # 1) 좌석등급 패널에서 선택 등급을 클릭해 펼친 뒤 구역을 읽는다
             zs = self._get_zones_for_grade(gname)
