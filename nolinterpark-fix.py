@@ -2875,11 +2875,13 @@ class MacroThread(QThread):
 
     # ── 구역 순회 ─────────────────────────────
     def _rotate_zones(self, zones, grade=None):
-        cycle = 0
+        cycle = 0                 # 바퀴 수: 탐색을 시작할 때마다 0부터
+        started = time.time()
         consecutive_err = 0
         self._diag_done = False
-        self.log("빈 좌석 탐색을 시작합니다")
+        self.log("빈 좌석 탐색을 시작합니다 (1바퀴째부터)")
         while True:
+            entered = 0           # 이번 바퀴에서 실제로 들어가 본 구역 수
             for zone in zones:
                 self._wait(0)
                 # 브라우저 세션 생존 확인 (닫히면 매크로 전체 중단)
@@ -2900,6 +2902,7 @@ class MacroThread(QThread):
                         self._wait(0.3)     # 클릭 실패가 이어져도 헛돌지 않게
                         continue
 
+                    entered += 1
                     self._wait(self.delay)
                     self._solve_puzzle()
 
@@ -2916,9 +2919,19 @@ class MacroThread(QThread):
                     if consecutive_err >= 15:
                         self.log("오류가 계속되어 순회를 중단합니다."); return
                     self._wait(0.5)
+            if not entered:
+                # 구역을 하나도 누르지 못한 바퀴는 세지 않는다 (숫자만 빠르게 올라가는 것 방지)
+                if not getattr(self, '_noenter_warned', False):
+                    self._noenter_warned = True
+                    self.log("구역을 누르지 못하고 있습니다. 좌석 선택 화면(전체 구역 보기)인지 "
+                             "확인해 주세요.")
+                self._wait(1.0)
+                continue
+            self._noenter_warned = False
             cycle += 1
             if cycle % 5 == 0:
-                self.log(f"빈 좌석 탐색 중... ({cycle}바퀴째, 아직 못 찾음)")
+                mins = int((time.time() - started) // 60)
+                self.log(f"빈 좌석 탐색 중... ({cycle}바퀴째, {mins}분 경과, 아직 못 찾음)")
 
     # ── 좌석 DOM 진단 (구조 파악용, 1회) ───────
     # 좌석을 못 잡을 때 실제 좌석 요소 샘플을 로그로 출력한다.
@@ -3457,6 +3470,9 @@ class ControlWindow(QWidget):
         self._thread.stop()
         self._thread.wait(2000)
         event.accept()
+        # 창을 닫으면 프로그램을 완전히 끝낸다. (탐색 스레드가 뒤에 남아
+        # 예전 실행이 계속 도는 일이 없도록. 크롬 창은 그대로 둔다)
+        QApplication.quit()
 
 
 # ───────────────────────────────────────────────
@@ -3533,4 +3549,5 @@ if __name__ == "__main__":
     app.setFont(QFont("맑은 고딕", 10))
     win = LoginWindow()
     win.show()
-    sys.exit(app.exec())
+    code = app.exec()
+    os._exit(code)      # 남아 있는 스레드가 있어도 프로세스를 확실히 종료
