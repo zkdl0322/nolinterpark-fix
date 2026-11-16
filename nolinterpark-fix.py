@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
+import hashlib
 import io
+import json
 import os
 import re
 import sys
@@ -32,6 +34,8 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QTextEdit, QMessageBox
 )
 
+# 한 번 읽은 좌석배치도(구역 이름/색/위치)를 기억해 두는 파일
+ZONE_CACHE_FILE = os.path.join(os.path.expanduser("~"), ".nolinterpark_zones.json")
 SEARCH_DELAY = 1          # 구역을 누른 뒤 좌석 화면이 뜨기를 기다리는 시간(초)
 LOGIN_URL   = (
     "https://accounts.yanolja.com/v3/login"
@@ -1579,11 +1583,97 @@ class MacroThread(QThread):
 
     # 배치도를 화면에 보이는 그림 그대로 캡처해 색 덩어리(구역)로 나눈다.
     # svg 안의 <image>, <img> 파일, canvas 로 그려진 배치도 모두 대응.
+    # ── 좌석배치도 기억 ───────────────────────
+    # 배치도 그림 파일 주소(공연장 배치도마다 고유) + 화면에 보이는 크기를 열쇠로,
+    # 한 번 읽은 구역 목록(이름/색/위치)을 파일에 저장해 두고 다음부터 바로 쓴다.
+    _JS_ONESTOP_MAP_ID = r"""
+    var root=document.querySelector('[class*="SeatMap"],[class*="seatMap"]');
+    var n=root;
+    while(n && n.parentElement){
+        var c=(n.parentElement.getAttribute('class'))||'';
+        if(/seatmap/i.test(c)) root=n.parentElement;
+        n=n.parentElement;
+    }
+    if(!root) root=arguments[0]||document.body;
+    var urls=[], seen={};
+    function add(u){
+        if(!u || /^data:/.test(u)) return;
+        u=u.split('#')[0].split('?')[0];
+        if(!seen[u] && urls.length<30){ seen[u]=1; urls.push(u); }
+    }
+    var els=root.querySelectorAll('img,image,[style*="background"],[class*="Img"]');
+    for(var i=0;i<els.length;i++){
+        var e=els[i];
+        add(e.currentSrc||e.getAttribute('src')||e.getAttribute('href')||e.getAttribute('xlink:href'));
+        var bg=getComputedStyle(e).backgroundImage||'';
+        var m=bg.match(/url\(["']?([^"')]+)["']?\)/);
+        if(m) add(m[1]);
+    }
+    return urls;
+    """
+
+    def _zone_cache_key(self, m):
+        try:
+            urls = self.driver.execute_script(self._JS_ONESTOP_MAP_ID, m.get('el')) or []
+        except Exception:
+            urls = []
+        if not urls:
+            return None                       # 배치도를 구분할 근거가 없으면 기억하지 않음
+        raw = "|".join(sorted(urls)) + "|%dx%d" % (round(m['width']), round(m['height']))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def _zone_cache_load(self):
+        try:
+            with open(ZONE_CACHE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _zone_cache_save(self, key, zones):
+        try:
+            d = self._zone_cache_load()
+            d[key] = {'saved': time.strftime("%Y-%m-%d %H:%M:%S"), 'zones': zones}
+            if len(d) > 200:                  # 너무 쌓이면 오래된 것부터 정리
+                for k in sorted(d, key=lambda k: d[k].get('saved', ''))[:len(d) - 200]:
+                    d.pop(k, None)
+            tmp = ZONE_CACHE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False)
+            os.replace(tmp, ZONE_CACHE_FILE)
+        except Exception:
+            pass
+
+    # 기억해 둔 구역 위치가 지금 화면과 맞는지: 구역 자리의 절반 이상에 색이 칠해져 있어야 함
+    @staticmethod
+    def _zones_match_image(zones, im):
+        if not zones:
+            return False
+        W, H = im.size
+        hit = 0
+        for z in zones:
+            try:
+                r, g, b = im.getpixel((min(W - 1, int(z['fx'] * W)), min(H - 1, int(z['fy'] * H))))[:3]
+            except Exception:
+                continue
+            if max(r, g, b) - min(r, g, b) >= 38:
+                hit += 1
+        return hit * 2 >= len(zones)
+
     def _scan_onestop_image(self):
         im, m = self._map_capture(with_html=True)
         if im is None:
             return []
         self._onestop_map_html = m.get('html') or ''
+        # 전에 본 배치도면 기억해 둔 구역 목록을 그대로 쓴다
+        key = self._zone_cache_key(m)
+        if key:
+            hit = self._zone_cache_load().get(key)
+            if hit and self._zones_match_image(hit.get('zones') or [], im):
+                if getattr(self, '_cache_logged', None) != key:
+                    self._cache_logged = key
+                    self.log(f"기억해 둔 좌석배치도를 사용합니다 (구역 {len(hit['zones'])}개)")
+                return [dict(z) for z in hit['zones']]
         # 너무 크면 줄여서 처리 (경계선이 사라지지 않을 정도로만)
         if im.width > 1100:
             k = 1100.0 / im.width
@@ -1604,6 +1694,10 @@ class MacroThread(QThread):
                 'label': name or 'Z%d' % i, 'color': z['color'], 'named': bool(name),
                 'hint': H3[min(2, int(z['cx'] * 3))] + ' ' + V3[min(2, int(z['cy'] * 3))],
                 'fx': z['fx'], 'fy': z['fy'], 'src': 'onestop', 'href': ''})
+        # 제대로 읽힌 배치도만 기억한다 (구역 3개 이상, 이름을 80% 이상 읽음)
+        named = sum(1 for z in zones if z['named'])
+        if key and len(zones) >= 3 and named >= 0.8 * len(zones):
+            self._zone_cache_save(key, zones)
         return zones
 
     # 화면 좌표를 실제 마우스로 클릭
