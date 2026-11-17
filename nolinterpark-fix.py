@@ -1923,8 +1923,19 @@ class MacroThread(QThread):
                 m = None
             if not m:
                 return False
-            return self._click_viewport_point(m['left'] + m['width'] * zone['fx'],
-                                              m['top'] + m['height'] * zone['fy'])
+            x = m['left'] + m['width'] * zone['fx']
+            y = m['top'] + m['height'] * zone['fy']
+            # 그 자리를 버튼([예매대기] 등)이 덮고 있으면 누르지 않는다
+            try:
+                covered = drv.execute_script(
+                    "var e=document.elementFromPoint(arguments[0],arguments[1]);"
+                    "return !!(e && e.closest && e.closest('button,a,[role=\"button\"],input'));",
+                    x, y)
+            except Exception:
+                covered = False
+            if covered:
+                return False
+            return self._click_viewport_point(x, y)
         # 2) DOM 에서 읽은 구역: 표시해 둔 요소의 안쪽 점 클릭
         try:
             pt = drv.execute_script(self._JS_ONESTOP_POINT, label)
@@ -2010,6 +2021,74 @@ class MacroThread(QThread):
             self.log(f"[진단] 페이지 구조를 저장했습니다: {path}")
         except Exception:
             pass
+
+    # ── 예매대기 안내 팝업 닫기 ───────────────
+    # 남은 좌석이 없는 구역을 누르면 사이트가 "원하는 좌석이 없으면? 예매대기를
+    # 신청하세요!" 팝업을 띄운다. [신청하기]는 절대 누르지 않고 X 로 닫기만 한다.
+    _JS_WAITLIST_POPUP = r"""
+    var els=document.querySelectorAll('h1,h2,h3,h4,strong,b,p,span,div');
+    var title=null;
+    for(var i=0;i<els.length;i++){
+        var t=(els[i].textContent||'').replace(/\s+/g,'');
+        if(t.length>60 || t.indexOf('예매대기를신청하세요')<0) continue;
+        var r=els[i].getBoundingClientRect();
+        if(r.width>0 && r.height>0){ title=els[i]; break; }
+    }
+    if(!title) return null;
+    // 팝업 상자: [신청하기] 버튼까지 품은 가장 가까운 조상
+    var box=title.parentElement;
+    for(var d=0; d<8 && box; d++, box=box.parentElement){
+        if(/신청하기/.test(box.textContent||'') && box.querySelector('button,[role="button"]')) break;
+    }
+    if(!box) return {found:true, close:null};
+    var br=box.getBoundingClientRect(), best=null, bestScore=-1e9;
+    var cands=box.querySelectorAll('button,[role="button"],a,svg');
+    for(var i=0;i<cands.length;i++){
+        var c=cands[i], txt=(c.textContent||'').replace(/\s+/g,'');
+        if(txt.length>0) continue;                       // 글자 있는 버튼(신청하기 등) 제외
+        var r=c.getBoundingClientRect();
+        if(r.width<=0 || r.height<=0 || r.width>80 || r.height>80) continue;
+        var score=(r.left-br.left)-(r.top-br.top);       // 오른쪽 위에 있을수록 높음
+        if(score>bestScore){ bestScore=score; best=c; }
+    }
+    return {found:true, close:best};
+    """
+
+    def _dismiss_waitlist_popup(self):
+        drv = self.driver
+        try:
+            drv.switch_to.default_content()
+            info = drv.execute_script(self._JS_WAITLIST_POPUP)
+        except Exception:
+            return False
+        if not info or not info.get('found'):
+            return False
+        for attempt in range(3):
+            el = (info or {}).get('close')
+            try:
+                if el is not None and attempt < 2:
+                    try:
+                        ActionChains(drv).move_to_element(el).click().perform()
+                    except Exception:
+                        drv.execute_script(
+                            "var e=arguments[0];e.dispatchEvent(new MouseEvent('click',"
+                            "{bubbles:true,cancelable:true,view:window}));", el)
+                else:
+                    from selenium.webdriver.common.keys import Keys
+                    ActionChains(drv).send_keys(Keys.ESCAPE).perform()
+            except Exception:
+                pass
+            self._wait(0.3)
+            try:
+                info = drv.execute_script(self._JS_WAITLIST_POPUP)
+            except Exception:
+                info = None
+            if not info or not info.get('found'):
+                return True
+        if not getattr(self, '_popup_warned', False):
+            self._popup_warned = True
+            self.log("예매대기 안내 팝업을 닫지 못했습니다. X 를 눌러 닫아 주세요.")
+        return True
 
     # ── 신형 onestop: 배치도 캡처 / 전체보기 복귀 / 좌석 클릭 ──
     def _onestop_map_shot(self):
@@ -2171,6 +2250,8 @@ class MacroThread(QThread):
         if self._seat_selected() is True:
             self.log("→ 좌석 이미 선택됨")
             return True
+        if self._dismiss_waitlist_popup():
+            return False                    # 예매대기 안내가 떴다 = 이 구역엔 남은 좌석 없음
         if getattr(self, '_sel_count', 0) > 0:
             # 필요 매수보다 적게 남아 있는 선택은 비우고 다시 찾는다
             self._click_text_button(["전체삭제"])
@@ -2832,12 +2913,19 @@ class MacroThread(QThread):
         except Exception: pass
         if self._is_onestop():
             zd = zone if isinstance(zone, dict) else None
+            self._zone_soldout = False
+            self._dismiss_waitlist_popup()          # 떠 있는 팝업이 있으면 먼저 닫는다
             # 앞 구역의 좌석 화면(확대 상태)에 있으면 전체 구역 보기로 되돌린다
             if zd is not None and zd.get('fx') is not None:
                 if self._onestop_back_to_overview() is False:
                     # 확대된 상태에서 구역 위치를 누르면 엉뚱한 좌석이 눌릴 수 있어 건너뜀
                     return False
             if self._click_onestop_zone(zone_num, zd):
+                # 남은 좌석이 없는 구역이면 예매대기 안내 팝업이 뜬다 → 닫고 다음 구역으로
+                self._wait(0.35)
+                if self._dismiss_waitlist_popup():
+                    self._zone_soldout = True
+                    return False
                 return True
             # 화면이 다시 그려져 표시가 사라졌으면 다시 스캔 후 재시도
             for z in self._scan_onestop_zones():
@@ -2993,6 +3081,9 @@ class MacroThread(QThread):
                 try:
                     # 구역 클릭 (실패해도 다음 구역으로). zone 은 dict 또는 문자열.
                     if not self._click_zone(zone):
+                        if getattr(self, '_zone_soldout', False):
+                            entered += 1    # 눌렀지만 남은 좌석이 없는 구역 (팝업 닫고 통과)
+                            continue
                         self._wait(0.3)     # 클릭 실패가 이어져도 헛돌지 않게
                         continue
 
