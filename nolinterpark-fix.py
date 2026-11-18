@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 
 # 한 번 읽은 좌석배치도(구역 이름/색/위치)를 기억해 두는 파일
 ZONE_CACHE_FILE = os.path.join(os.path.expanduser("~"), ".nolinterpark_zones.json")
+APP_VERSION = "2026-11-18b"   # 실행 로그에 찍히는 버전 (최신 코드로 빌드됐는지 확인용)
 SEARCH_DELAY = 1          # 구역을 누른 뒤 좌석 화면이 뜨기를 기다리는 시간(초)
 LOGIN_URL   = (
     "https://accounts.yanolja.com/v3/login"
@@ -1766,7 +1767,8 @@ class MacroThread(QThread):
             res = []
         if not res:
             # 구역 번호가 글자로 없으면 배치도의 색칠된 도형을 구역으로 읽는다
-            shapes = self._scan_onestop_shapes()
+            shapes = [z for z in self._scan_onestop_shapes()
+                      if not re.fullmatch(r"[가-힣\s]+", z.get('label', ''))]   # '예매대기' 같은 글자 제외
             if shapes and all(z.get('named') for z in shapes):
                 return shapes
             # 배치도를 그림으로 캡처해 색 덩어리로 구역을 나누고 이름(글자)을 읽는다
@@ -3648,7 +3650,7 @@ class MacroThread(QThread):
     def run(self):
         try:
             # ① 로그인 대기
-            self.log("매크로 실행 시작")
+            self.log(f"매크로 실행 시작 (버전 {APP_VERSION})")
             self.log("로그인을 완료해 주세요.")
             for _ in range(300):
                 self._wait(1)
