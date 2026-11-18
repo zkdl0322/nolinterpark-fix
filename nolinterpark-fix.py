@@ -2282,16 +2282,18 @@ class MacroThread(QThread):
             m, seats, n_all = m2, seats2, n_all2
             if same:
                 break
-        if not seats or m is None:
-            if n_all and not getattr(self, '_othercolor_warned', False):
+        need = max(1, getattr(self, 'need', 1))
+        if m is None:
+            return False
+        groups = adjacent_seat_groups(seats, need) if seats else []
+        if not groups:
+            # 화면에 보이는 부분에 없으면, 화면 밖으로 잘린 같은 구역 좌석을 찾아본다
+            if self._click_offscreen_seats(target, need, m):
+                return True
+            if not seats and n_all and not getattr(self, '_othercolor_warned', False):
                 self._othercolor_warned = True
                 self.log(f"※ 선택 등급 색이 아닌 좌석만 {n_all}개 보여 건너뜁니다.")
-            return False
-
-        need = max(1, getattr(self, 'need', 1))
-        groups = adjacent_seat_groups(seats, need)
-        if not groups:
-            if need > 1 and not getattr(self, '_adj_warned', False):
+            if seats and need > 1 and not getattr(self, '_adj_warned', False):
                 self._adj_warned = True
                 self.log(f"※ 붙어 있는 {need}연석이 없는 구역은 건너뜁니다.")
             return False
@@ -2328,6 +2330,186 @@ class MacroThread(QThread):
                 self._click_text_button(["전체삭제"])
                 self._wait(0.5)
             self.log("좌석을 눌렀지만 선택되지 않았습니다")
+        return False
+
+    # ── 화면 밖 좌석: 배치도를 끌어서 옮긴 뒤 클릭 ──
+    # 좌석은 배치도 SVG 안의 동그라미(circle)로 그려져 있어, 화면 밖에 있어도 DOM 에서
+    # 위치와 색을 읽을 수 있다. 방금 누른 구역(화면에 가장 많이 보이는 좌석 묶음 g)의
+    # 좌석만 대상으로 하고, 회색이 아닌 좌석이 화면 밖에 있으면 배치도를 끌어 가져온다.
+    _JS_DOM_SEATS = r"""
+    var svg=arguments[0], V=arguments[1];
+    if(!svg) return null;
+    function rgb(s){
+        var m=(s||'').match(/(\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?/);
+        if(!m || (m[4]!==undefined && +m[4]===0)) return null;
+        return [+m[1],+m[2],+m[3]];
+    }
+    var cs=svg.querySelectorAll('circle,ellipse');
+    if(cs.length<10) return null;
+    var groups=[], gid=new Map(), seats=[];
+    for(var i=0;i<cs.length;i++){
+        var c=cs[i], r=c.getBoundingClientRect();
+        if(r.width<3 || r.height<3 || r.width>80 || r.height>80) continue;
+        var g=c.closest('g') || svg;
+        if(!gid.has(g)){ gid.set(g, groups.length); groups.push(0); }
+        var k=gid.get(g);
+        var x=r.left+r.width/2, y=r.top+r.height/2;
+        if(x>=V.left && x<=V.left+V.width && y>=V.top && y<=V.top+V.height) groups[k]++;
+        var st=getComputedStyle(c), col=rgb(st.fill);
+        if(!col || Math.max.apply(null,col)-Math.min.apply(null,col)<38) col=rgb(st.stroke);
+        seats.push({i:i, g:k, x:x, y:y, side:(r.width+r.height)/2, color:col});
+        c.setAttribute('data-macro-seat', i);
+    }
+    // 방금 누른 구역 = 화면 안에 좌석이 가장 많이 보이는 묶음
+    var cur=-1, best=0;
+    for(var k=0;k<groups.length;k++) if(groups[k]>best){ best=groups[k]; cur=k; }
+    if(cur<0) return null;
+    var out=[];
+    for(var j=0;j<seats.length;j++){
+        var st=seats[j];
+        if(st.g!==cur || !st.color) continue;
+        if(Math.max.apply(null,st.color)-Math.min.apply(null,st.color)<38) continue;  // 회색=매진
+        out.push(st);
+    }
+    return {seats:out, blocks:groups.length};
+    """
+
+    _JS_SEAT_POS = r"""
+    var out=[];
+    for(var k=0;k<arguments[0].length;k++){
+        var c=document.querySelector('[data-macro-seat="'+arguments[0][k]+'"]');
+        if(!c){ out.push(null); continue; }
+        var r=c.getBoundingClientRect();
+        out.push([r.left+r.width/2, r.top+r.height/2]);
+    }
+    return out;
+    """
+
+    def _seat_positions(self, ids):
+        try:
+            return self.driver.execute_script(self._JS_SEAT_POS, ids) or []
+        except Exception:
+            return []
+
+    # 배치도 안에서 좌석이 아닌 빈 자리(끌기 시작점) 찾기
+    def _drag_start_point(self, V):
+        js = r"""
+        var V=arguments[0];
+        var fx=[.5,.35,.65,.5,.5,.25,.75,.25,.75,.15,.85];
+        var fy=[.5,.5,.5,.35,.65,.25,.75,.75,.25,.5,.5];
+        for(var i=0;i<fx.length;i++){
+            var x=V.left+V.width*fx[i], y=V.top+V.height*fy[i];
+            var e=document.elementFromPoint(x,y);
+            if(!e) continue;
+            var t=(e.tagName||'').toLowerCase();
+            if(t==='circle'||t==='ellipse') continue;
+            if(e.closest && e.closest('button,a,[role="button"],input')) continue;
+            return [x,y];
+        }
+        return [V.left+V.width/2, V.top+V.height/2];
+        """
+        try:
+            return self.driver.execute_script(js, V)
+        except Exception:
+            return [V['left'] + V['width'] / 2, V['top'] + V['height'] / 2]
+
+    # (tx,ty) 지점이 배치도 가운데 쪽으로 오도록 끌어서 옮긴다. ids 는 위치를 다시 잴 좌석.
+    def _pan_seats_into_view(self, ids, V):
+        drv = self.driver
+
+        def center():
+            pos = [p for p in self._seat_positions(ids) if p]
+            if not pos:
+                return None
+            return (sum(p[0] for p in pos) / len(pos), sum(p[1] for p in pos) / len(pos))
+
+        def inside(c, inset):
+            return (V['left'] + V['width'] * inset <= c[0] <= V['left'] + V['width'] * (1 - inset)
+                    and V['top'] + V['height'] * inset <= c[1] <= V['top'] + V['height'] * (1 - inset))
+
+        cx, cy = V['left'] + V['width'] / 2, V['top'] + V['height'] / 2
+        for _ in range(6):
+            c = center()
+            if c is None:
+                return False
+            if inside(c, 0.2):
+                return True
+            sx, sy = self._drag_start_point(V)
+            # 끄는 거리: 목표를 가운데로. 끝점이 배치도 밖으로 나가지 않게 자른다
+            ex = min(max(sx + (cx - c[0]), V['left'] + 8), V['left'] + V['width'] - 8)
+            ey = min(max(sy + (cy - c[1]), V['top'] + 8), V['top'] + V['height'] - 8)
+            try:
+                ac = ActionChains(drv, duration=40)
+                pa = ac.w3c_actions.pointer_action
+                pa.move_to_location(int(sx), int(sy))
+                pa.pointer_down()
+                for k in (0.25, 0.5, 0.75, 1.0):
+                    pa.move_to_location(int(sx + (ex - sx) * k), int(sy + (ey - sy) * k))
+                    pa.pause(0.03)
+                pa.pointer_up()
+                ac.perform()
+            except Exception:
+                return False
+            self._wait(0.4)
+            c2 = center()
+            if c2 is None or (abs(c2[0] - c[0]) < 3 and abs(c2[1] - c[1]) < 3):
+                if not getattr(self, '_pan_warned', False):
+                    self._pan_warned = True
+                    self.log("※ 배치도를 끌어서 옮기지 못했습니다 (화면 밖 좌석은 건너뜀)")
+                return False
+        c = center()
+        return c is not None and inside(c, 0.05)
+
+    def _click_offscreen_seats(self, target, need, m):
+        drv = self.driver
+        V = {'left': m['left'], 'top': m['top'], 'width': m['width'], 'height': m['height']}
+        try:
+            r = drv.execute_script(self._JS_DOM_SEATS, m.get('el'), V)
+        except Exception:
+            r = None
+        if not r or not r.get('seats'):
+            return False
+        seats = r['seats']
+        if target:
+            th = _hue(target)
+            seats = [st for st in seats
+                     if min(abs(_hue(st['color']) - th) % 360.0,
+                            360.0 - abs(_hue(st['color']) - th) % 360.0) <= 28.0]
+        # 화면 안쪽 좌석은 이미 그림으로 확인했으니 화면 밖(가장자리 포함) 것만
+        def visible(st):
+            return (V['left'] + 4 <= st['x'] <= V['left'] + V['width'] - 4
+                    and V['top'] + 4 <= st['y'] <= V['top'] + V['height'] - 4)
+        if not seats or all(visible(st) for st in seats):
+            return False
+        for st in seats:
+            st['px'], st['py'] = st['x'], st['y']
+        groups = [g for g in adjacent_seat_groups(seats, need)
+                  if not all(visible(st) for st in g)]
+        if not groups:
+            return False
+        import random
+        random.shuffle(groups)
+        self.log(f"화면 밖 좌석 {len(seats)}개 발견 → 배치도를 옮겨서 클릭 시도")
+        for group in groups[:2]:
+            ids = [st['i'] for st in group]
+            if not self._pan_seats_into_view(ids, V):
+                continue
+            self._wait(0.2)
+            pts = self._seat_positions(ids)
+            if not pts or any(p is None for p in pts):
+                continue
+            ok = True
+            for x, y in pts:
+                before = self._selected_count()
+                if not self._click_one_seat(x, y, before):
+                    ok = False
+                    break
+            if ok and self._seat_selected() is True:
+                self.log("→ 좌석 선택 성공")
+                return True
+            if self._selected_count() > 0:
+                self._click_text_button(["전체삭제"])
+                self._wait(0.5)
         return False
 
     # 현재 선택된 좌석 수 (모르면 0)
