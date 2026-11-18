@@ -1366,7 +1366,7 @@ class MacroThread(QThread):
     var box = best ? best.getBoundingClientRect() : null;
     // 아이콘 같은 작은 svg 뿐이면 배치도가 아님 → 영역 필터 생략
     if(area < 40000) box = null;
-    var LABEL=/^(?:[A-Z]|[A-Z]?[1-9]\d{0,3}|[가-힣]{1,2}\d{0,3})$/;
+    var LABEL=/^(?:[A-Z]|[A-Z]{0,2}[1-9]\d{0,3}|[가-힣][1-9]\d{0,3})$/;
     var SKIP={'STAGE':1,'FOH':1};
     var out=[], seen={};
     var nodes=document.querySelectorAll('text,tspan,span,div,p,strong,b,button');
@@ -1377,6 +1377,8 @@ class MacroThread(QThread):
         var t=(el.textContent||'').replace(/\s+/g,'');
         if(!t || SKIP[t] || !LABEL.test(t) || seen[t]) continue;
         if(!vis(el)) continue;
+        // 버튼/링크 안의 글자([예매대기], +/- 등)는 구역 이름이 아님
+        if(el.closest && el.closest('button,a,[role="button"]')) continue;
         var r=el.getBoundingClientRect();
         var cx=r.left+r.width/2, cy=r.top+r.height/2;
         // 좌석배치도 영역 밖(헤더 날짜/시간 등)은 제외
@@ -1759,6 +1761,9 @@ class MacroThread(QThread):
         for z in res:
             z['src'] = 'onestop'
             z['href'] = ''
+        if len(res) < 3:
+            # 글자로 찾은 구역이 2개 이하면 배치도 구역이 아니라 다른 글자를 잘못 읽은 것
+            res = []
         if not res:
             # 구역 번호가 글자로 없으면 배치도의 색칠된 도형을 구역으로 읽는다
             shapes = self._scan_onestop_shapes()
